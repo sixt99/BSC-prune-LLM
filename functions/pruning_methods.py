@@ -29,7 +29,7 @@ def randomly_prune_blocks(matrix, n_blocks, block_size):
         block.fill_(0)
 
 
-def randomly_prune_blocks_by_area(matrix, area_percentage, block_size):
+def randomly_prune_blocks_by_area(matrix, area_percentage, block_size, verbose = False):
     random.seed(time.time())
     grid_size_x = matrix.shape[0] // block_size
     grid_size_y = matrix.shape[1] // block_size
@@ -37,8 +37,7 @@ def randomly_prune_blocks_by_area(matrix, area_percentage, block_size):
     # Find n_blocks unique pairs (i,j)
     pairs = set()
     while (
-        len(pairs) * block_size**2 / (matrix.shape[0] * matrix.shape[1])
-        < area_percentage
+        len(pairs) * block_size**2 / (matrix.shape[0] * matrix.shape[1]) < area_percentage
     ):
         i = random.randint(0, grid_size_x - 1)
         j = random.randint(0, grid_size_y - 1)
@@ -46,12 +45,17 @@ def randomly_prune_blocks_by_area(matrix, area_percentage, block_size):
 
     # Remove the block associated to each unique pair (i,j)
     for pair in pairs:
-        i = pair[0]
-        j = pair[1]
+        i, j = pair
         block = matrix[
             block_size * i : block_size * (i + 1), block_size * j : block_size * (j + 1)
         ]
         block.fill_(0)
+
+    if verbose:
+        output = {}
+        output['grid_size'] = (grid_size_x, grid_size_y)
+        output['pairs'] = pairs
+        return output
 
 
 def prune_blocks_with_probabilities(matrix, n_blocks, block_size):
