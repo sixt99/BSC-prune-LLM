@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
+from datasets import load_metric
 
 def tokenize_function(examples):
    return tokenizer(examples["sentence"], truncation=True)
@@ -32,8 +33,8 @@ tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)
 tokenized_datasets = tokenized_datasets.remove_columns(["sentence", "idx"])
 tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
 tokenized_datasets.set_format("torch")
-train_data = tokenized_datasets["train"].shuffle(seed=42).select(range(10))
-eval_data = tokenized_datasets["validation"].shuffle(seed=42).select(range(10))
+train_data = tokenized_datasets["train"].shuffle(seed=42).select(range(500))
+eval_data = tokenized_datasets["validation"].shuffle(seed=42).select(range(500))
 
 # Data_collator
 data_collator = DataCollatorWithPadding(tokenizer)
@@ -50,6 +51,11 @@ lr_scheduler = get_scheduler(
     name="linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
 )
 progress_bar = tqdm(range(num_training_steps))
+metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
+metrics = {}
+results = {}
+for name in metric_names:
+    metrics[name] = evaluate.load(name)
 model.train()
 for epoch in range(num_epochs):
     for batch in train_dataloader:
@@ -62,15 +68,20 @@ for epoch in range(num_epochs):
         optimizer.zero_grad()
         progress_bar.update(1)
 
-metric = evaluate.load("accuracy")
-model.eval()
-for batch in eval_dataloader:
-    batch = {k: v.to(device) for k, v in batch.items()}
-    with torch.no_grad():
-        outputs = model(**batch)
+    # Evaluate after every epoch
+    model.eval()
+    for batch in eval_dataloader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            outputs = model(**batch)
 
-    logits = outputs.logits
-    predictions = torch.argmax(logits, dim=-1)
-    metric.add_batch(predictions=predictions, references=batch["labels"])
+        logits = outputs.logits
+        predictions = torch.argmax(logits, dim=-1)
+        for name in metric_names:
+            metrics[name].add_batch(predictions=predictions, references=batch["labels"])
 
-print(metric.compute())
+    for name in metric_names:
+        results.update(metrics[name].compute())
+
+    print(results)
+    model.train()
