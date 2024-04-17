@@ -28,3 +28,10 @@ def compute_metrics(pred):
         "f1": f1,
         "matthews": mcc,
     }
+
+def create_mask(pairs, size, block_size):
+    mask = torch.zeros(size, dtype=torch.bool)
+    for pair in pairs:
+        i, j = pair
+        mask[i*block_size:(i+1)*block_size,j*block_size:(j+1)*block_size].fill_(1)
+    return mask

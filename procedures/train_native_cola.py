@@ -1,10 +1,9 @@
+import torch.utils
 from functions.make_plots import *
 from functions.pruning_methods import *
 from functions.initialization import *
 from transformers import (
     AutoModelForSequenceClassification,
-    Trainer,
-    TrainingArguments,
     AutoTokenizer,
     DataCollatorWithPadding,
     get_scheduler
@@ -15,36 +14,45 @@ from tqdm.auto import tqdm
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from datasets import load_metric
 
 def tokenize_function(examples):
    return tokenizer(examples["sentence"], truncation=True)
 
+# Define the device
 device = torch.device("mps")
 
-# Tokenizer
-tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
-model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", num_labels=2)
+# Tokenizer and model
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+#model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+model = AutoModelForSequenceClassification.from_pretrained("model", num_labels=2)
 model.to(device)
 
-# Datasets
+# Prune the model
+area_percentage = 0.3
+block_size = 64
+masks = {}
+for x in model.state_dict().keys():
+    tensor = model.state_dict()[x]
+    if ".layer." in x and len(tensor.size()) == 2:
+        output = randomly_prune_blocks_by_area(tensor, area_percentage = area_percentage, block_size = block_size, verbose = True)
+        masks[x] = create_mask(output['pairs'], output['original_size'], block_size = block_size)
+
+# Obtain datasets
 raw_datasets = load_dataset("glue", "cola")
 tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)
 tokenized_datasets = tokenized_datasets.remove_columns(["sentence", "idx"])
 tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
 tokenized_datasets.set_format("torch")
-train_data = tokenized_datasets["train"].shuffle(seed=42).select(range(500))
-eval_data = tokenized_datasets["validation"].shuffle(seed=42).select(range(500))
+train_data = tokenized_datasets["train"]#.shuffle(seed=42).select(range(10))
+eval_data = tokenized_datasets["validation"]#.shuffle(seed=42).select(range(10))
 
-# Data_collator
+# Data_collator and data_loaders
 data_collator = DataCollatorWithPadding(tokenizer)
-
-# Data_loaders
 train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=data_collator)
 eval_dataloader = DataLoader(eval_data, batch_size=8, collate_fn=data_collator)
 
 # Training
-num_epochs = 3
+num_epochs = 5
 optimizer = AdamW(model.parameters(), lr=5e-5)
 num_training_steps = num_epochs * len(train_dataloader)
 lr_scheduler = get_scheduler(
@@ -63,6 +71,14 @@ for epoch in range(num_epochs):
         outputs = model(**batch)
         loss = outputs.loss
         loss.backward()
+
+        for name, param in model.named_parameters():
+            if name in masks.keys():
+                grad = param.grad
+                mask = masks[name]
+                grad[mask] = 0
+                #plot_matrix_analysis(grad.cpu().detach().numpy(), visualization_mode='std')
+
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
@@ -85,3 +101,7 @@ for epoch in range(num_epochs):
 
     print(results)
     model.train()
+
+output_dir = "/Users/sixteoriolllenassegura/prune_llm/trainings/prune_and_train_0grad_a0.3_bz64"
+model.save_pretrained(output_dir)
+tokenizer.save_pretrained(output_dir)

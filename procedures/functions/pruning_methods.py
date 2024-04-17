@@ -53,6 +53,7 @@ def randomly_prune_blocks_by_area(matrix, area_percentage, block_size, verbose =
 
     if verbose:
         output = {}
+        output['original_size'] = matrix.shape
         output['grid_size'] = (grid_size_x, grid_size_y)
         output['pairs'] = pairs
         return output
