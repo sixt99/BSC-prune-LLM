@@ -28,7 +28,7 @@ def randomly_prune_blocks(matrix, n_blocks, block_size):
         ]
         block.fill_(0)
 
-
+# TODO this can be greatly improved by considering random_numbers = random.sample(range(0, 11), 5)
 def randomly_prune_blocks_by_area(matrix, area_percentage, block_size, verbose = False):
     random.seed(time.time())
     grid_size_x = matrix.shape[0] // block_size
@@ -36,9 +36,7 @@ def randomly_prune_blocks_by_area(matrix, area_percentage, block_size, verbose =
 
     # Find n_blocks unique pairs (i,j)
     pairs = set()
-    while (
-        len(pairs) * block_size**2 / (matrix.shape[0] * matrix.shape[1]) < area_percentage
-    ):
+    while (len(pairs) * block_size**2 / (matrix.shape[0] * matrix.shape[1]) < area_percentage):
         i = random.randint(0, grid_size_x - 1)
         j = random.randint(0, grid_size_y - 1)
         pairs.add((i, j))

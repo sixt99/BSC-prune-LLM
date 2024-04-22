@@ -6,7 +6,6 @@ from transformers import (
     Trainer,
     TrainingArguments
 )
-import pickle
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 from datasets import load_dataset
@@ -14,7 +13,7 @@ from datasets import load_dataset
 def preprocess_function(examples):
     return tokenizer(examples["sentence"], truncation=True, padding=True)
 
-path = "/Users/sixteoriolllenassegura/prune_llm/trainings/prune_and_train_0grad_a0.3_bz64"
+path = "/Users/sixteoriolllenassegura/prune_llm/model"
 model = AutoModelForSequenceClassification.from_pretrained(path, num_labels=2)
 tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 dataset = load_dataset("glue", "cola")

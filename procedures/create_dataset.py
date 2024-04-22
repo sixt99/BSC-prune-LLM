@@ -6,22 +6,17 @@ from transformers import (
     Trainer,
     TrainingArguments
 )
-import pickle
+from datasets import load_dataset
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 def preprocess_function(examples):
     return tokenizer(examples["sentence"], truncation=True, padding=True)
 
-#tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-with open("tokenizer/distilbert-base-uncased-tokenizer.pkl", 'rb') as file:
-    tokenizer = pickle.load(file)
-
-#dataset = load_dataset("glue", "cola")
-#tokenized_dataset = dataset.map(preprocess_function, batched=True)
-with open("data/cola.pkl", 'rb') as file:
-    tokenized_dataset = pickle.load(file)
-tokenized_dataset = tokenized_dataset['validation']
+# Tokenizer and dataset
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+dataset = load_dataset("glue", "cola")
+tokenized_dataset = dataset.map(preprocess_function, batched=True)['validation']
 
 training_args = TrainingArguments(
     per_device_eval_batch_size=100,
@@ -34,7 +29,7 @@ area_percentage = 0.1
 block_size = 64
 layer = 'distilbert.transformer.layer.0.attention.q_lin.weight'
 
-file_name = f"outputs/output_a{area_percentage}_bs{block_size}.csv"
+file_name = f"outputs/{layer}/output_a{area_percentage}_bs{block_size}.csv"
 for iter in range(repetitions):
     model = load_model()
     trainer = Trainer(
