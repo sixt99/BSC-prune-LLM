@@ -24,14 +24,16 @@ training_args = TrainingArguments(
     output_dir="./results",
 )
 
+model = load_model()
+
 # Parameters
-max_n_rows = 500
+max_n_rows = 50
 area_percentage = 0.3
 block_size = 128
 
-for num_layer in range(0,6):
-    for type in ['q','k','v']:
-        layer = f'distilbert.transformer.layer.{num_layer}.attention.{type}_lin.weight'
+for layer in model.state_dict():
+    matrix = model.state_dict()[layer].cpu().detach().numpy()
+    if len(matrix.shape) == 2 and layer.startswith("distilbert.transformer.layer"):
         file_name = f"outputs/{layer}/output_a{area_percentage}_bs{block_size}.csv"
 
         # If the folder is not found, create it

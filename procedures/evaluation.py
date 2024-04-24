@@ -13,11 +13,11 @@ from datasets import load_dataset
 def preprocess_function(examples):
     return tokenizer(examples["sentence"], truncation=True, padding=True)
 
-path = "/Users/sixteoriolllenassegura/prune_llm/model"
+path = "model"
 model = AutoModelForSequenceClassification.from_pretrained(path, num_labels=2)
 tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 dataset = load_dataset("glue", "cola")
-encoded_dataset = dataset.map(preprocess_function, batched=True)['validation']
+encoded_dataset = dataset.map(preprocess_function, batched=True)['train']
 
 training_args = TrainingArguments(
     per_device_eval_batch_size=100,
@@ -33,4 +33,4 @@ trainer = Trainer(
 evaluation = trainer.evaluate(encoded_dataset)
 print(evaluation)
 
-#print_weight_matrices(model.cpu(), visualization_mode='abs')
+print_weight_matrices(model.cpu(), visualization_mode='abs')

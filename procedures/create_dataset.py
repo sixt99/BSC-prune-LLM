@@ -25,9 +25,9 @@ training_args = TrainingArguments(
 
 # Parameters
 repetitions = 500
-area_percentage = 0.1
-block_size = 64
-layer = 'distilbert.transformer.layer.0.attention.q_lin.weight'
+area_percentage = 0.3
+block_size = 128
+layer = 'distilbert.transformer.layer.3.ffn.lin1.weight'
 
 file_name = f"outputs/{layer}/output_a{area_percentage}_bs{block_size}.csv"
 for iter in range(repetitions):
