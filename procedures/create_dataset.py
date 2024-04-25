@@ -24,12 +24,13 @@ training_args = TrainingArguments(
 )
 
 # Parameters
-repetitions = 500
+repetitions = 2000
 area_percentage = 0.3
 block_size = 128
-layer = 'distilbert.transformer.layer.3.ffn.lin1.weight'
+layer = 'distilbert.transformer.layer.2.ffn.lin1.weight'
 
 file_name = f"outputs/{layer}/output_a{area_percentage}_bs{block_size}.csv"
+print(file_name)
 for iter in range(repetitions):
     model = load_model()
     trainer = Trainer(

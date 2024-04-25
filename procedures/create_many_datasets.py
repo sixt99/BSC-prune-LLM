@@ -27,7 +27,7 @@ training_args = TrainingArguments(
 model = load_model()
 
 # Parameters
-max_n_rows = 50
+max_n_rows = 100
 area_percentage = 0.3
 block_size = 128
 
@@ -35,6 +35,7 @@ for layer in model.state_dict():
     matrix = model.state_dict()[layer].cpu().detach().numpy()
     if len(matrix.shape) == 2 and layer.startswith("distilbert.transformer.layer"):
         file_name = f"outputs/{layer}/output_a{area_percentage}_bs{block_size}.csv"
+        print(file_name)
 
         # If the folder is not found, create it
         if not os.path.exists(f"outputs/{layer}/"):

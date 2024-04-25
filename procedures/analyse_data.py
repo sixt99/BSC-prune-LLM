@@ -7,10 +7,10 @@ from functions.initialization import *
 from numpy.linalg import norm
 
 # Define parameters
-layer_name = "distilbert.transformer.layer.3.ffn.lin1.weight"
+layer_name = "distilbert.transformer.layer.2.ffn.lin1.weight"
 dataset_path = f"outputs/{layer_name}/output_a0.3_bs128.csv"
 sort_by = "eval_matthews"
-n_superpositions = 3
+n_superpositions = 10
 
 df = pd.read_csv(dataset_path)
 idxs = np.argsort(df[sort_by])
@@ -56,8 +56,21 @@ fig.colorbar(bar)
 axs[0,1].set_title('Superposed worst configurations')
 
 # Plot histogram of the selected column
-axs[1,0].hist(df[sort_by], bins=70, color='skyblue', edgecolor='black')
 axs[1,0].axvline(x=base[sort_by], color='red', linestyle='--')
+axs[1,0].hist(df[sort_by], bins=50, color='skyblue', edgecolor='black', density=True)
+
+# Plot gaussian on top of histogram
+lim_a = np.min(df[sort_by])
+lim_b = np.max(df[sort_by])
+mu = np.mean(df[sort_by])
+sigma = np.std(df[sort_by])
+median = np.median(df[sort_by])
+
+x = np.linspace(lim_a, lim_b, 1000)
+gaussian = (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(
+    -((x - mu) ** 2) / (2 * sigma**2)
+)
+axs[1,0].plot(x, gaussian, color="red", label="Gaussian")
 
 # Plot real matrix
 model = load_model()
