@@ -1,7 +1,5 @@
 import torch.utils
-from functions.make_plots import *
-from functions.pruning_methods import *
-from functions.initialization import *
+from utils import *
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,

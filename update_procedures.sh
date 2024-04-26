@@ -1,0 +1,1 @@
+scp -r procedures bsc003268@glogin1.bsc.es:prune_llm

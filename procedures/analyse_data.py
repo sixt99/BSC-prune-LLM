@@ -1,16 +1,15 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from functions.make_plots import *
-from functions.pruning_methods import *
-from functions.initialization import *
+from utils import *
 from numpy.linalg import norm
 
 # Define parameters
-layer_name = "distilbert.transformer.layer.2.ffn.lin1.weight"
-dataset_path = f"outputs/{layer_name}/output_a0.3_bs128.csv"
+#layer_name = "distilbert.transformer.layer.1.ffn.lin1.weight"
+#dataset_path = f"outputs/{layer_name}/output_a0.3_bs128.csv"
+dataset_path = f"global_output/output_a0.3_bs128.csv"
 sort_by = "eval_matthews"
-n_superpositions = 10
+n_superpositions = 30
 
 df = pd.read_csv(dataset_path)
 idxs = np.argsort(df[sort_by])
@@ -56,7 +55,7 @@ fig.colorbar(bar)
 axs[0,1].set_title('Superposed worst configurations')
 
 # Plot histogram of the selected column
-axs[1,0].axvline(x=base[sort_by], color='red', linestyle='--')
+#axs[1,0].axvline(x=base[sort_by], color='red', linestyle='--')
 axs[1,0].hist(df[sort_by], bins=50, color='skyblue', edgecolor='black', density=True)
 
 # Plot gaussian on top of histogram
@@ -74,8 +73,8 @@ axs[1,0].plot(x, gaussian, color="red", label="Gaussian")
 
 # Plot real matrix
 model = load_model()
-tensor = model.state_dict()[layer_name]
-axs[1,1].imshow(np.abs(tensor)>0.05)
+# tensor = model.state_dict()[layer_name]
+# axs[1,1].imshow(np.abs(tensor)>0.05)
 axs[1,1].set_title('Real matrix')
 plt.tight_layout()
 plt.show()
