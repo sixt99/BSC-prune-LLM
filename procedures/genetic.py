@@ -86,35 +86,63 @@ def prune_model_by_genes(model, pruning_info, genes):
             model.state_dict()[layer_name][block_size * i : block_size * (i + 1), block_size * j : block_size * (j + 1)].fill_(0)
             gene_count += 2
 
-def mutate(genes, pruning_info, mutation_probability, mutation_policy = "randomly_change"):
+def get_real_area_percentage_from_genes(model, pruning_info, genes):
+    area = 0
+    gene_count = 0
+    for block_count in pruning_info['n_blocks']:
+        s = set()
+        for _ in range(block_count):
+            i = genes[gene_count]
+            j = genes[gene_count + 1]
+            s.add((i, j))
+            gene_count += 2
+        area += len(s)
+    total_area = np.sum([grid_shape_x * grid_shape_y for grid_shape_x, grid_shape_y in pruning_info['grid_shapes']])
+    return area / total_area
+
+def mutate(genes, pruning_info, mutation_probability, mutation_policy = "randomly_slide_by_one_position"):
     random.seed(time.time())
     mutated_genes = []
+    count = 0
     gene_count = 0
     for (grid_shape_x, grid_shape_y), block_count in zip(pruning_info['grid_shapes'], pruning_info['n_blocks']):
+
         pairs = set()
         for _ in range(block_count):
-            mutate = random.random() <= mutation_probability
-            if not mutate:
-                mutated_genes.append(genes[gene_count])
-                mutated_genes.append(genes[gene_count + 1])
-            else:
+            pairs.add((genes[count], genes[count + 1]))
+            count += 2
+
+        assert(len(pairs) == block_count)
+
+        for _ in range(block_count):
+            current_gene = (genes[gene_count], genes[gene_count + 1])
+            if random.random() <= mutation_probability:
                 if mutation_policy == 'randomly_change':
                     while True:
                         i = random.randint(0, grid_shape_x - 1)
                         j = random.randint(0, grid_shape_y - 1)
-                        if (i,j) not in pairs and (i,j) != (genes[gene_count], genes[gene_count + 1]):
+                        if (i,j) not in pairs and (i,j) != current_gene:
+                            pairs.remove(current_gene)
                             pairs.add((i,j))
-                            mutated_genes += [i,j]
                             break
+                        
                 elif mutation_policy == 'randomly_slide_by_one_position':
-                    while True:
-                        i = genes[gene_count] + random.choice([-1,0,1])
-                        j = genes[gene_count + 1] + random.choice([-1,0,1])
-                        if (i,j) not in pairs and (i,j) != (genes[gene_count], genes[gene_count + 1]):
+                    possible_slides = [[i, j] for i in [-1, 0, 1] for j in [-1, 0, 1]]
+                    possible_slides.remove([0,0])
+                    random.shuffle(possible_slides)
+                    for possible_slide in possible_slides:
+                        i = genes[gene_count] + possible_slide[0]
+                        j = genes[gene_count + 1] + possible_slide[1]
+                        in_grid = (0 <= i < grid_shape_x) and (0 <= j < grid_shape_y)
+                        if (i,j) not in pairs and (i,j) != current_gene and in_grid:
+                            pairs.remove(current_gene)
                             pairs.add((i,j))
-                            mutated_genes += [i,j]
                             break
             gene_count += 2
+        
+        assert(len(pairs) == block_count)
+        for pair in pairs:
+            mutated_genes += pair
 
     return mutated_genes
 
@@ -125,9 +153,9 @@ n_generations = 10
 n_individuals = 10
 select_n_best = 3
 area_percentage = 0.3
-block_size = 64
+block_size = 128
 metric = "eval_matthews"
-mutation_probability = 0.4
+mutation_probability = 0.1
 
 # Initialize model and get some information about the pruning
 model = load_model()
@@ -136,7 +164,7 @@ tokenized_dataset = load_tokenized_data(tokenizer)['validation']
 pruning_info = get_pruning_info(model, area_percentage, block_size)
 
 # Path definitions
-output_path = "/Users/sixteoriolllenassegura/prune_llm/procedures/genetic_outputs"
+output_path = "procedures/genetic_outputs"
 attempt_path = create_attempt_folder(output_path)
 generation_path = create_generation_csv(attempt_path)
 

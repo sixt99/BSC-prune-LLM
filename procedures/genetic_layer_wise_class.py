@@ -28,6 +28,7 @@ class GeneticPruner:
         self.columns += ['pruned_area','n_blocks','genes']
         self.best_individual = None
         self.folder_counter = 0
+        self.model_counter = 0
 
         self.model = None
         self.layer_names = None
@@ -82,6 +83,11 @@ class GeneticPruner:
         copy_dict['best_individual'] = self.best_individual.to_dict()
         with open(self.layer_path + "/configuration.json", 'w') as file:
             json.dump(copy_dict, file, indent=4, cls=NpEncoder)
+
+    # TODO
+    def save(self):
+        model_path = self.attempt_path + f"/model_{self.model_counter}"
+        self.model_counter += 1
 
     def initialize(self, population_size, weight, best = None):
         self.population_size = population_size
@@ -184,23 +190,14 @@ class GeneticPruner:
         trainer = load_trainer(model)
         n_blocks_per_layer = self.prune_model_by_genes(model, genes)
         evaluation = trainer.evaluate(self.tokenized_dataset['validation'])
+        evaluation_train = trainer.evaluate(self.tokenized_dataset['train'])
+        for x in evaluation.keys():
+            evaluation[x.split('eval_')[1]] = evaluation_train[x]
         evaluation['pruned_area'] = np.sum(n_blocks_per_layer) / self.total_n_blocks
         evaluation['eval_gm'] = self.gm(evaluation['pruned_area'], evaluation['eval_matthews'])
         evaluation['eval_custom'] = self.custom(evaluation['pruned_area'], evaluation['eval_matthews'])
         evaluation['n_blocks'] = n_blocks_per_layer
-        evaluation['genes'] = list(genes)
-        evaluation_train = trainer.evaluate(self.tokenized_dataset['train'])
-        evaluation['loss'] = evaluation_train['eval_loss']
-        evaluation['accuracy'] = evaluation_train['eval_accuracy']
-        evaluation['precision'] = evaluation_train['eval_precision']
-        evaluation['recall'] = evaluation_train['eval_recall']
-        evaluation['f1'] = evaluation_train['eval_f1']
-        evaluation['matthews'] = evaluation_train['eval_matthews']
-        evaluation['gm'] = self.gm(evaluation['pruned_area'], evaluation_train['eval_matthews'])
-        evaluation['custom'] = self.custom(evaluation['pruned_area'], evaluation_train['eval_matthews'])
-        evaluation['runtime'] = evaluation_train['eval_runtime']
-        evaluation['samples_per_second'] = evaluation_train['eval_samples_per_second']
-        evaluation['steps_per_second'] = evaluation_train['eval_steps_per_second']        
+        evaluation['genes'] = list(genes)     
         return evaluation
 
     def prune_model_by_genes(self, model, genes):
