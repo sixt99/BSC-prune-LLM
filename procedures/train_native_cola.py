@@ -2,73 +2,49 @@ import torch.utils
 from utils import *
 from transformers import (
     AutoModelForSequenceClassification,
-    AutoTokenizer,
     DataCollatorWithPadding,
     get_scheduler
 )
+from datasets import load_metric
 import torch
-import evaluate
 from tqdm.auto import tqdm
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-import os
-import pandas as pd
-def tokenize_function(examples):
-   return tokenizer(examples["sentence"], truncation=True)
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Define the device
-device = torch.device("mps")
+def prune_model_by_genes(model, genes, metadata):
+    if not isinstance(genes, np.ndarray):
+        genes = np.array(genes)
+    gene_count = 0
+    n_blocks_per_layer = []
+    block_size = metadata['block_size']
+    for layer_name, (grid_size_x, grid_size_y) in zip(metadata['pruned_layer_names'], metadata['grid_shapes']):
+        idxs = np.where(genes[gene_count : gene_count + grid_size_x * grid_size_y] == 1)[0]
+        n_blocks_per_layer.append(len(idxs))
+        for idx in idxs:
+            i = idx // grid_size_y
+            j = idx % grid_size_y
+            model.state_dict()[layer_name][block_size * i : block_size * (i + 1), block_size * j : block_size * (j + 1)].fill_(0)
+        gene_count += grid_size_x * grid_size_y
+
+    return n_blocks_per_layer, genes
+
+# Define device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-#model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
-model = AutoModelForSequenceClassification.from_pretrained("model", num_labels=2)
-model.to(device)
-
-# Prune the model
-area_percentage = 0.3
-block_size = 128
-sort_by = "eval_matthews"
-masks = {}
-# Randomly prune and save the masks
-# for x in model.state_dict().keys():
-#     tensor = model.state_dict()[x]
-#     if ".layer." in x and len(tensor.size()) == 2:
-#         output = randomly_prune_blocks_by_area(tensor, area_percentage = area_percentage, block_size = block_size, verbose = True)
-#         masks[x] = create_mask(output['pairs'], output['original_size'], block_size = block_size)
-
-# Prune according to the best configurations
-# Iterate over the layers
-for layer in model.state_dict():
-    matrix = model.state_dict()[layer]
-    if len(matrix.shape) == 2: # If the weights are matrices
-        file_name = f"outputs/{layer}/output_a{area_percentage}_bs{block_size}.csv"
-        if not os.path.exists(file_name): # If we don't have information about this layer, don't prune it
-            continue
-
-        if "ffn.lin1" in layer: # We do not modify these matrices
-            continue
-        
-        # Get the best distribution of blocks according to sort_by metric
-        df = pd.read_csv(file_name)
-        best_idx = np.argmax(df[sort_by])
-        string = df.loc[best_idx]['pairs'][2:-2].split('),(')        
-        pairs = [list(map(int, x.split(','))) for x in string]
-
-        # Prune the matrix with the given blocks
-        output = prune_by_pairs(matrix, pairs, block_size, verbose=True)
-
-#print_weight_matrices(model.cpu(), visualization_mode='abs')
+model = AutoModelForSequenceClassification.from_pretrained("./trainings/before", num_labels=2)
+model = model.to(device)
+tokenizer = load_tokenizer()
 
 # Obtain datasets
-raw_datasets = load_dataset("glue", "cola")
-tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)
+tokenized_datasets = load_tokenized_data(tokenizer)
 tokenized_datasets = tokenized_datasets.remove_columns(["sentence", "idx"])
 tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
 tokenized_datasets.set_format("torch")
-train_data = tokenized_datasets["train"]#.shuffle(seed=42).select(range(10))
-eval_data = tokenized_datasets["validation"]#.shuffle(seed=42).select(range(10))
+train_data = tokenized_datasets["train"]#.shuffle(seed=42).select(range(100))
+eval_data = tokenized_datasets["validation"]#.shuffle(seed=42).select(range(100))
 
 # Data_collator and data_loaders
 data_collator = DataCollatorWithPadding(tokenizer)
@@ -87,8 +63,14 @@ metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
 metrics = {}
 results = {}
 for name in metric_names:
-    metrics[name] = evaluate.load(name)
+    metrics[name] = load_metric(f'./metrics/{name}')
+
 model.train()
+
+# BIG TODO
+#for param in model.bert.parameters():
+#    param.requires_grad = False
+
 for epoch in range(num_epochs):
     for batch in train_dataloader:
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -96,10 +78,10 @@ for epoch in range(num_epochs):
         loss = outputs.loss
         loss.backward()
 
+        # Set grads of blocks to zero
         for name, param in model.named_parameters():
             if len(param.shape) == 2:
                 param.grad[param.cpu().detach().numpy()==0] = 0
-                #plot_matrix_analysis(param.grad.cpu().detach().numpy(), visualization_mode='std')
 
         optimizer.step()
         lr_scheduler.step()
@@ -124,6 +106,6 @@ for epoch in range(num_epochs):
     print(results)
     model.train()
 
-output_dir = "/Users/sixteoriolllenassegura/prune_llm/trainings/take_best_matrices_a0.3_bz128"
+output_dir = "./trainings/after"
 model.save_pretrained(output_dir)
 tokenizer.save_pretrained(output_dir)

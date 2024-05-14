@@ -148,20 +148,7 @@ class GeneticPruner:
         )
         self.folder_counter += 1
         os.mkdir(self.layer_path)
-
-        # Create a copy of the current class and dump it to a .json file
-        # This file will inform us of the current parameter configuration for each layer-iteration
-        copy_dict = self.__dict__.copy()
-        copy_dict.pop("tokenized_dataset")
-        copy_dict.pop('model')
-        copy_dict["best_individual"] = self.best_individual.to_dict()
-        copy_dict["best_individual"]['n_blocks'] = str(copy_dict["best_individual"]['n_blocks']).replace(' ','')
-        copy_dict["best_individual"]['genes'] = str(copy_dict["best_individual"]['genes']).replace(' ','')
-        copy_dict['grid_shapes'] = str(copy_dict['grid_shapes']).replace(' ','')
-        copy_dict['blocks_per_layer'] = str(copy_dict['blocks_per_layer']).replace(' ','')
-        with open(self.layer_path + "/configuration.json", "w") as file:
-            json.dump(copy_dict, file, indent=4, cls=NpEncoder)
-        
+    
     # TODO
     def save(self):
         model_path = self.attempt_path + f"/model_{self.model_counter}"
@@ -176,15 +163,16 @@ class GeneticPruner:
         # - the dataset in which it is found
         # - the path where to find the dataset
         if best is not None:
-            if best.isinstance(dict):
+            if isinstance(best, dict):
                 self.best_individual = best
-            elif best.isinstance(pd.DataFrame):
+            elif isinstance(best, pd.DataFrame):
                 self.best_individual = df.loc[np.argmax(df[self.metric]).tolist()]
-            elif best.isinstance(str):
+            elif isinstance(best, str):
                 df = pd.read_csv(best)
-                self.best_individual = df.loc[np.argmax(df[self.metric]).tolist()]
-                self.best_individual["genes"] = self.best_individual["genes"].apply(self.string2genes)
-            
+                best_individual_copy = df.loc[np.argmax(df[self.metric]).tolist()].copy()
+                best_individual_copy['genes'] = self.string2genes(best_individual_copy['genes'])
+                self.best_individual = best_individual_copy
+
             # We must reajust eval_custom accordingly in case self.weight has changed
             self.best_individual["eval_custom"] = self.custom(
                 self.best_individual["pruned_area"],
@@ -236,7 +224,7 @@ class GeneticPruner:
         for i, n_blocks in enumerate(self.blocks_per_layer):
             if i < self.layer_idx:
                 self.position.append(n_blocks)
-        self.position = np.sum(self.position)).astype(int)
+        self.position = np.sum(self.position).astype(int)
 
         # Create a new folder dedicated to the pruning of the specific layer
         self.create_layer_folder()
@@ -304,6 +292,21 @@ class GeneticPruner:
             indent=4,
         )
         print(best_individual_so_far)
+        self.dump_parameter_configuration()
+
+    def dump_parameter_configuration(self):
+        # Create a copy of the current class and dump it to a .json file
+        # This file will inform us of the current parameter configuration for each layer-iteration
+        copy_dict = self.__dict__.copy()
+        copy_dict.pop("tokenized_dataset")
+        copy_dict.pop('model')
+        copy_dict["best_individual"] = self.best_individual.to_dict()
+        copy_dict["best_individual"]['n_blocks'] = str(copy_dict["best_individual"]['n_blocks']).replace(' ','')
+        copy_dict["best_individual"]['genes'] = str(copy_dict["best_individual"]['genes']).replace(' ','')
+        copy_dict['grid_shapes'] = str(copy_dict['grid_shapes']).replace(' ','')
+        copy_dict['blocks_per_layer'] = str(copy_dict['blocks_per_layer']).replace(' ','')
+        with open(self.layer_path + "/configuration.json", "w") as file:
+            json.dump(copy_dict, file, indent=4, cls=NpEncoder)
 
     def randomly_populate(self):
         # Start with a new dataset, only containing the best individual found so far
@@ -401,7 +404,7 @@ class GeneticPruner:
 
         return mutated_genes
 
-    def string2genes(string):
+    def string2genes(self, string):
         return list(map(int, string[1:-1].split(", ")))
 
     def gm(self, pruned_area, matthews):
@@ -425,17 +428,78 @@ def main():
     model = load_model()
     tokenized_dataset = load_tokenized_data()
     genetic_pruner = GeneticPruner(
-        block_size=64, metric="eval_custom", tokenized_dataset=tokenized_dataset
+        block_size=128, metric="eval_custom", tokenized_dataset=tokenized_dataset
     )
     genetic_pruner.fit(model)
-    genetic_pruner.initialize(population_size=3, weight=4)
+    path = "procedures/genetic_outputs/attempt_122/59_distilbert.transformer.layer.0.attention.q_lin.weight/generation_9.csv"
+    #path = "/Users/sixteoriolllenassegura/prune_llm/marenostrum_layerwise/attempt_123/28_distilbert.transformer.layer.1.attention.k_lin.weight/generation_6.csv"
+    genetic_pruner.initialize(population_size=30, weight=4, best = path)
+
+    for layer_name in genetic_pruner.layer_names[::-1]:
+        if 'v_lin' in layer_name:
+            genetic_pruner.evolve(
+                population_size=30,
+                mutation_rate=0.1,
+                n_generations=3,
+                select_n_best=10,
+                elitism_rate=2,
+                weight=4,
+                layer_name=layer_name,
+            )
+        
+    for layer_name in genetic_pruner.layer_names[::-1]:
+        if 'k_lin' in layer_name:
+            genetic_pruner.evolve(
+                population_size=30,
+                mutation_rate=0.1,
+                n_generations=3,
+                select_n_best=10,
+                elitism_rate=2,
+                weight=4,
+                layer_name=layer_name,
+            )
+
+        for layer_name in genetic_pruner.layer_names[::-1]:
+            if 'q_lin' in layer_name:
+                genetic_pruner.evolve(
+                    population_size=30,
+                    mutation_rate=0.1,
+                    n_generations=3,
+                    select_n_best=10,
+                    elitism_rate=2,
+                    weight=4,
+                    layer_name=layer_name,
+                )
+
+    for layer_name in genetic_pruner.layer_names[::-1]:
+        if 'out' in layer_name:
+            genetic_pruner.evolve(
+                population_size=20,
+                mutation_rate=0.1,
+                n_generations=5,
+                select_n_best=10,
+                elitism_rate=2,
+                weight=4,
+                layer_name=layer_name,
+            )
 
     for layer_name in genetic_pruner.layer_names[::-1]:
         genetic_pruner.evolve(
-            population_size=3,
+            population_size=30,
+            mutation_rate=0.3,
+            n_generations=3,
+            select_n_best=10,
+            elitism_rate=2,
+            weight=4,
+            layer_name=layer_name,
+        )
+
+    for layer_name in genetic_pruner.layer_names:
+        genetic_pruner.evolve(
+            population_size=30,
             mutation_rate=0.1,
-            n_generations=10,
-            select_n_best=15,
+            n_generations=3,
+            select_n_best=10,
             elitism_rate=2,
             weight=4,
             layer_name=layer_name,
