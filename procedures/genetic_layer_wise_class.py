@@ -5,6 +5,15 @@ import copy
 import uuid
 import json
 import warnings
+from transformers import (
+    DataCollatorWithPadding,
+    get_scheduler
+)
+from datasets import load_metric
+import torch
+from tqdm.auto import tqdm
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -16,14 +25,6 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(obj, list):
             return str(obj)
         return super(NpEncoder, self).default(obj)
-
-
-class Evolver():
-    pass
-
-
-class Trainer():
-    pass
 
 
 class GeneticPruner:
@@ -64,8 +65,6 @@ class GeneticPruner:
         ]
         self.best_individual = None
         self.folder_counter = 0
-        # TODO
-        self.model_counter = 0
 
         self.model = None
         self.layer_names = None
@@ -85,20 +84,18 @@ class GeneticPruner:
         self.layer_path = None
         self.position = None
 
-    def fit(self, model):
+    def fit(self, model, print_initial_evalutaion = False):
         # Set the starting non-pruned model
         self.model = model
 
-        # Create a new attempt
-        self.create_attempt_folder()
-
         # Evaluate the starting model on both train and validation datasets
-        print("Evaluation of non-pruned model:")
-        trainer = load_trainer(model)
-        evaluation_train = trainer.evaluate(self.tokenized_dataset["train"])
-        evaluation_validation = trainer.evaluate(self.tokenized_dataset["validation"])
-        print("Train set:\n", json.dumps(evaluation_train, indent=4))
-        print("Validation set:\n", json.dumps(evaluation_validation, indent=4))
+        if print_initial_evalutaion:
+            print("Evaluation of non-pruned model:")
+            trainer = load_trainer(model)
+            evaluation_train = trainer.evaluate(self.tokenized_dataset["train"])
+            evaluation_validation = trainer.evaluate(self.tokenized_dataset["validation"])
+            print("Train set:\n", json.dumps(evaluation_train, indent=4))
+            print("Validation set:\n", json.dumps(evaluation_validation, indent=4))
 
         # Define the target weight matrices to be pruned
         # By default, we prune those matrices whose name contains ".layer."
@@ -108,7 +105,7 @@ class GeneticPruner:
                 self.layer_names.append(layer_name)
         
         # Find the grid structure in our pruning
-        # For example, if block_size = 64, we get a list of type:
+        # For example, if block_size = 64, we get a list of tuples like the following:
         # [(12, 12), (12, 12), (12, 12), (12, 12), (48, 12), (12, 48), ..., (12, 12), (48, 12), (12, 48)]
         self.grid_shapes = []
         for layer_name in self.layer_names:
@@ -149,14 +146,13 @@ class GeneticPruner:
         self.folder_counter += 1
         os.mkdir(self.layer_path)
     
-    # TODO
-    def save(self):
-        model_path = self.attempt_path + f"/model_{self.model_counter}"
-        self.model_counter += 1
-
     def initialize(self, population_size, weight, best=None):
         self.population_size = population_size
         self.weight = weight
+
+        # Create a new attempt
+        self.create_attempt_folder()
+
         # We already have a good individual, so we wish to start from there
         # Such individual can be passed as:
         # - a dictionary
@@ -421,9 +417,117 @@ class GeneticPruner:
         else:
             # Numerator rescales metric so that its values go from 0 to 1
             return (1 + self.weight) / (1 / pruned_area + self.weight / matthews)
+        
+
+class GeneticTrainer:
+    def __init__(self, num_epochs):
+        self.num_epochs = num_epochs
+        self.model = None
+        self.optimizer = None
+        self.training_arguments = None
+        self.trainer = None
+        self.tokenizer = None
+        self.tokenized_dataset = None
+        self.output_path = None
+        self.model_counter = 0
+
+    def fit(self, model, output_path):
+        self.model = model
+        self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
+        self.trainer = load_trainer(model)
+        self.tokenizer = load_tokenizer()
+        self.tokenized_dataset = load_tokenized_data(self.tokenizer)
+        self.output_path = output_path
+
+    def train(self, layer_list, threshold = 0.05):
+        self.tokenized_dataset = self.tokenized_dataset.remove_columns(["sentence", "idx"])
+        self.tokenized_dataset = self.tokenized_dataset.rename_column("label", "labels")
+        self.tokenized_dataset.set_format("torch")
+        train_data = self.tokenized_dataset["train"]#.shuffle(seed=42).select(range(100))
+        eval_data = self.tokenized_dataset["validation"]#.shuffle(seed=42).select(range(100))
+
+        data_collator = DataCollatorWithPadding(self.tokenizer)
+        train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=data_collator)
+        eval_dataloader = DataLoader(eval_data, batch_size=8, collate_fn=data_collator)
+
+        num_training_steps = self.num_epochs * len(train_dataloader)
+        lr_scheduler = get_scheduler(
+            name="linear", optimizer=self.optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
+        )
+        progress_bar = tqdm(range(num_training_steps))
+        metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
+        metrics = {}
+        results = {}
+        for name in metric_names:
+            metrics[name] = load_metric(f'./metrics/{name}')
+
+        self.model.train()
+
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
+        
+        for param in self.model.distilbert.parameters():
+            tensor = param.cpu().detach().numpy()
+            if len(tensor.shape) == 2 and np.sum(tensor == 0) / (tensor.shape[0] * tensor.shape[1]) >= threshold:
+                param.requires_grad = False
+
+        for epoch in range(self.num_epochs):
+            for batch in train_dataloader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = self.model(**batch)
+                loss = outputs.loss
+                loss.backward()
+
+                # Set grads of blocks to zero
+                for name, param in self.model.named_parameters():
+                    if len(param.shape) == 2 and param.requires_grad:
+                        param.grad[param.cpu().detach().numpy()==0] = 0
+
+                self.optimizer.step()
+                lr_scheduler.step()
+                self.optimizer.zero_grad()
+                progress_bar.update(1)
+
+            # Evaluate after every epoch
+            self.model.eval()
+            for batch in eval_dataloader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                with torch.no_grad():
+                    outputs = self.model(**batch)
+
+                logits = outputs.logits
+                predictions = torch.argmax(logits, dim=-1)
+                for name in metric_names:
+                    metrics[name].add_batch(predictions=predictions, references=batch["labels"])
+
+            for name in metric_names:
+                results.update(metrics[name].compute())
+
+            print(results)
+            self.model.train()
+
+        if not os.path.exists(self.output_path):
+            os.mkdir(self.output_path)
+        n_models = np.max([int(x.split('model_')[1]) for x in os.listdir(self.output_path) if x.startswith('model_')]).astype(int)
+        self.model.save_pretrained(self.output_path + f'model_{n_models + self.model_counter + 1}')
+        self.model_counter += 1
 
 
 def main():
+    genes = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1]
+    model = load_model()
+    pruner = GeneticPruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data())
+    pruner.fit(model = model)
+    pruner.prune_model_by_genes(model, genes = genes)
+
+    trainer = GeneticTrainer(num_epochs=3)
+    trainer.fit(model, output_path = './')
+    trainer.train(threshold = 1, layer_list=pruner.layer_names)
+
+
+
+
+
+    '''
     # Initialize model and get some information about the pruning
     model = load_model()
     tokenized_dataset = load_tokenized_data()
@@ -431,70 +535,11 @@ def main():
         block_size=128, metric="eval_custom", tokenized_dataset=tokenized_dataset
     )
     genetic_pruner.fit(model)
-    path = "procedures/genetic_outputs/attempt_122/59_distilbert.transformer.layer.0.attention.q_lin.weight/generation_9.csv"
-    #path = "/Users/sixteoriolllenassegura/prune_llm/marenostrum_layerwise/attempt_123/28_distilbert.transformer.layer.1.attention.k_lin.weight/generation_6.csv"
+    #path = "procedures/genetic_outputs/attempt_122/59_distilbert.transformer.layer.0.attention.q_lin.weight/generation_9.csv"
+    path = "/Users/sixteoriolllenassegura/prune_llm/marenostrum_layerwise/attempt_122/59_distilbert.transformer.layer.0.attention.q_lin.weight/generation_9.csv"
     genetic_pruner.initialize(population_size=30, weight=4, best = path)
 
     for layer_name in genetic_pruner.layer_names[::-1]:
-        if 'v_lin' in layer_name:
-            genetic_pruner.evolve(
-                population_size=30,
-                mutation_rate=0.1,
-                n_generations=3,
-                select_n_best=10,
-                elitism_rate=2,
-                weight=4,
-                layer_name=layer_name,
-            )
-        
-    for layer_name in genetic_pruner.layer_names[::-1]:
-        if 'k_lin' in layer_name:
-            genetic_pruner.evolve(
-                population_size=30,
-                mutation_rate=0.1,
-                n_generations=3,
-                select_n_best=10,
-                elitism_rate=2,
-                weight=4,
-                layer_name=layer_name,
-            )
-
-        for layer_name in genetic_pruner.layer_names[::-1]:
-            if 'q_lin' in layer_name:
-                genetic_pruner.evolve(
-                    population_size=30,
-                    mutation_rate=0.1,
-                    n_generations=3,
-                    select_n_best=10,
-                    elitism_rate=2,
-                    weight=4,
-                    layer_name=layer_name,
-                )
-
-    for layer_name in genetic_pruner.layer_names[::-1]:
-        if 'out' in layer_name:
-            genetic_pruner.evolve(
-                population_size=20,
-                mutation_rate=0.1,
-                n_generations=5,
-                select_n_best=10,
-                elitism_rate=2,
-                weight=4,
-                layer_name=layer_name,
-            )
-
-    for layer_name in genetic_pruner.layer_names[::-1]:
-        genetic_pruner.evolve(
-            population_size=30,
-            mutation_rate=0.3,
-            n_generations=3,
-            select_n_best=10,
-            elitism_rate=2,
-            weight=4,
-            layer_name=layer_name,
-        )
-
-    for layer_name in genetic_pruner.layer_names:
         genetic_pruner.evolve(
             population_size=30,
             mutation_rate=0.1,
@@ -504,6 +549,6 @@ def main():
             weight=4,
             layer_name=layer_name,
         )
-
+    '''
 if __name__ == "__main__":
     main()
