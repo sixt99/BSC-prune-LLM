@@ -22,6 +22,8 @@ class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.int64):
             return int(obj)
+        if isinstance(obj, np.ndarray):
+            return str(list(obj))
         if isinstance(obj, list):
             return str(obj)
         return super(NpEncoder, self).default(obj)
@@ -34,13 +36,18 @@ class GeneticPruner:
         metric,
         tokenized_dataset,
         output_path="procedures/genetic_outputs",
+        avoid_repeated_individuals = True
     ):
         self.block_size = block_size
         self.metric = metric
         self.tokenized_dataset = tokenized_dataset
         self.output_path = output_path
+        self.avoid_repeated_individuals = avoid_repeated_individuals
         self.attempt_path = None
         self.attempt = None
+        self.mask = None
+        self.best_individual = None
+        self.folder_counter = 0
         self.columns = [
             "eval_loss",
             "eval_accuracy",
@@ -63,8 +70,6 @@ class GeneticPruner:
             "eval_gm",
             "eval_custom"
         ]
-        self.best_individual = None
-        self.folder_counter = 0
 
         self.model = None
         self.layer_names = None
@@ -78,11 +83,8 @@ class GeneticPruner:
         self.select_n_best = None
         self.elitism_rate = None
         self.weight = None
-        self.layer_idx = None
         self.layer_name = None
-        self.layer_size = None
         self.layer_path = None
-        self.position = None
 
     def fit(self, model, print_initial_evalutaion = False):
         # Set the starting non-pruned model
@@ -118,6 +120,9 @@ class GeneticPruner:
         # Get the total number of blocks in our list of grids
         # This value is the size of each chromosome
         self.total_n_blocks = np.sum(self.blocks_per_layer).astype(int)
+
+        # Set a general mask for now
+        self.mask = np.ones(self.total_n_blocks).astype(bool)
 
     def create_attempt_folder(self):
         # If output_path does not exist, create it
@@ -198,12 +203,13 @@ class GeneticPruner:
                 index=False,
             )
 
-    def evolve(self, population_size, mutation_rate, n_generations, select_n_best, elitism_rate, weight, layer_name):
+    def evolve(self, population_size, mutation_rate, n_generations, select_n_best, elitism_rate, weight, masking):
         self.population_size = population_size
         self.mutation_rate = mutation_rate
         self.n_generations = n_generations
         self.select_n_best = select_n_best
         self.elitism_rate = elitism_rate
+        self.set_mask(masking)
         self.weight = weight
 
         # We must reajust eval_custom accordingly in case self.weight has changed
@@ -211,23 +217,46 @@ class GeneticPruner:
             self.best_individual["pruned_area"],
             self.best_individual["eval_matthews"],
         )
-        
-        self.layer_idx = self.layer_names.index(layer_name)
-        self.layer_name = layer_name
-        self.layer_size = self.blocks_per_layer[self.layer_idx]
-
-        self.position = []
-        for i, n_blocks in enumerate(self.blocks_per_layer):
-            if i < self.layer_idx:
-                self.position.append(n_blocks)
-        self.position = np.sum(self.position).astype(int)
 
         # Create a new folder dedicated to the pruning of the specific layer
         self.create_layer_folder()
         self.evolve_()
 
+    def set_mask(self, masking):
+        # Case 1:
+        # masking is the layer's name, for example 'distilbert.transformer.layer.3.ffn.lin1.weight'
+        if isinstance(masking, str):
+            self.layer_name = masking
+            self.mask = np.zeros(self.total_n_blocks).astype(bool)
+            self.set_mask_elements(masking)
+
+        # Case 2:
+        # masking is a list of layer names, for example 
+        # ['distilbert.transformer.layer.3.ffn.lin1.weight', 'distilbert.transformer.layer.5.attention.v_lin.weight']
+        elif isinstance(masking, list) and all(isinstance(x, str) for x in masking):
+            self.layer_name = 'many'
+            self.mask = np.zeros(self.total_n_blocks).astype(bool)
+            for x in masking:
+                self.set_mask_elements(x)
+        
+        # Case 3:
+        # masking is the mask, for example [0,0,1,1,0,1,0,0,0,1,0,1,0,1,0]
+        elif (isinstance(masking, list) or isinstance(masking, np.ndarray)) and all(x == 0 or x == 1 for x in masking):
+            self.layer_name = 'unspecified'
+            self.mask = np.array(masking).astype(bool)
+
+    def set_mask_elements(self, layer_name):        
+        # Find which index corresponds to the given layer name
+        layer_idx = self.layer_names.index(layer_name)
+
+        # Find those gene positions associated with layer_name and set those to True
+        a = np.sum(self.blocks_per_layer[:layer_idx]).astype(int)
+        b = a + self.blocks_per_layer[layer_idx]
+        self.mask[a:b] = True
+
     def evolve_(self):
-        for generation in range(0, self.n_generations):
+        generation = 0
+        while generation < self.n_generations:
             print(f"* Generation {generation}")
 
             # In the first generation, generate a first population by randomly pruning the selected layer
@@ -243,29 +272,45 @@ class GeneticPruner:
                 # Select best indiviuals (elitism)
                 best_idxs = np.argsort(df[self.metric].tolist())[-(self.select_n_best) :]
                 print(df.loc[best_idxs, self.log_metrics])
+                generation += 1
                 continue
 
             # In the next generations, create a new one by starting from the best individuals of the last
             df_new = df.loc[best_idxs].reset_index(drop=True)
 
             # Repeat as many times as needed to reach a population of size self.population_size
-            for _ in range(self.population_size - len(df_new)):
+            while len(df_new) <= self.population_size:
                 np.random.seed(uuid.uuid4().int % 2**32)
 
                 # ----- CROSSOVER -----
                 i, j = np.random.choice(best_idxs, 2, replace=False)
-                genes1 = np.array(df.loc[i, "genes"])[self.position : self.position + self.layer_size]
-                genes2 = np.array(df.loc[j, "genes"])[self.position : self.position + self.layer_size]
+                genes1 = np.array(df.loc[i, "genes"])[self.mask]
+                genes2 = np.array(df.loc[j, "genes"])[self.mask]
                 offspring = self.crossover(genes1, genes2)
 
                 # ----- MUTATION -----
                 mutated_offspring = self.mutate(offspring)
 
-                # Create new genes and add them to the new dataset
+                # Create new genes and add them to the dataset
                 genes_new = np.array(list(self.best_individual["genes"])).copy()
-                genes_new[self.position : self.position + self.layer_size] = mutated_offspring
+                genes_new[self.mask] = mutated_offspring
+
+                if self.avoid_repeated_individuals and genes_new.tolist() in df_new['genes'].apply(list).tolist():
+                    continue
+
                 evaluation = self.evaluate_genes(genes_new)
                 df_new.loc[len(df_new)] = evaluation
+
+            # Select best indiviuals (elitism)
+            best_idxs = np.argsort(df_new[self.metric].tolist())[-(self.select_n_best) :]
+            print(df_new.loc[best_idxs, self.log_metrics])
+
+            # If we are at the last generation but we are still improving, don't stop
+            if generation + 1 == self.n_generations:
+                best_old = df.loc[np.argmax(df[self.metric].tolist()), self.metric]
+                best_current = df_new.loc[np.argmax(df_new[self.metric].tolist()), self.metric]
+                if best_old < best_current:
+                    self.n_generations += 1
 
             # The new population will be the last in the next iteration
             df = df_new
@@ -276,9 +321,7 @@ class GeneticPruner:
                 index=False,
             )
 
-            # Select best indiviuals (elitism)
-            best_idxs = np.argsort(df[self.metric].tolist())[-(self.select_n_best) :]
-            print(df_new.loc[best_idxs, self.log_metrics])
+            generation += 1
 
         # After finishing all the generations, this layer has been optimized
         self.best_individual = df.loc[np.argmax(df[self.metric].tolist())]
@@ -311,14 +354,16 @@ class GeneticPruner:
 
         # Create a population by randomly pruning the selected layer
         for _ in range(self.population_size - 1):
-            genes = self.best_individual["genes"].copy()
+            genes = np.array(self.best_individual["genes"].copy())
             np.random.seed(uuid.uuid4().int % 2**32)
             # Create individuals with different pruning probabilities
             # That is, we will have individuals with different densities of ones
             pruning_probability = np.random.uniform(0.05, 0.7)
-            genes[self.position : self.position + self.layer_size] = np.random.binomial(
-                1, pruning_probability, self.layer_size
-            )
+            genes[self.mask] = np.random.binomial(1, pruning_probability, np.sum(self.mask))
+
+            if self.avoid_repeated_individuals and genes.tolist() in df['genes'].apply(list).tolist():
+                continue
+
             evaluation = self.evaluate_genes(genes)
             df.loc[len(df)] = evaluation
         
@@ -388,7 +433,10 @@ class GeneticPruner:
     def mutate(self, genes):
         mutated_genes = genes.copy()
         p = self.mutation_rate
-        r = np.sum(mutated_genes) / (len(mutated_genes) - np.sum(mutated_genes))
+        if len(mutated_genes) - np.sum(mutated_genes) == 0:
+            r = 0
+        else:
+            r = np.sum(mutated_genes) / (len(mutated_genes) - np.sum(mutated_genes))
         for idx, x in enumerate(mutated_genes):
             np.random.seed(uuid.uuid4().int % 2**32)
 
@@ -513,42 +561,92 @@ class GeneticTrainer:
 
 
 def main():
-    genes = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1]
+    '''
     model = load_model()
-    pruner = GeneticPruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data())
+    pruner = GeneticPruner(block_size=256, metric='eval_custom', tokenized_dataset=load_tokenized_data())
     pruner.fit(model = model)
-    pruner.prune_model_by_genes(model, genes = genes)
+    pruner.prune_model_by_genes(model, genes = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,0,0,1,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,1,0,0,0,0,0,1,0,1,0,1,1,0,0,0,1,1,1,0,1,1,0,0,0,0,0,1,1,1,1,0,0,0,1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,1,0,0,0,0,1,0,0,1,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,1,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,1,0,1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,1,1,0,1,1,1,1,1,0,0,0,0,1,1,1,1,0,1,1,1,0,1,0,0,1,1,1,1,1,0,1,1,1,1,1,1,1,0,1,0,0,1,0,1,1,1,1,0,0,0,1,1,1,1,0,1,0,0,0,1,0,0,0,0,0,1,0,1,0,1,0,0,0,1,1,1,1,1,1,0,0,0,1,1,1,1,1,1,0,1,0,1,1,0,0,1,0,0,1,1,0,1,1,0,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,0,0])
 
-    trainer = GeneticTrainer(num_epochs=3)
+    trainer = GeneticTrainer(num_epochs=6)
     trainer.fit(model, output_path = './')
     trainer.train(threshold = 1, layer_list=pruner.layer_names)
-
-
-
-
-
     '''
+
     # Initialize model and get some information about the pruning
     model = load_model()
     tokenized_dataset = load_tokenized_data()
     genetic_pruner = GeneticPruner(
-        block_size=128, metric="eval_custom", tokenized_dataset=tokenized_dataset
+        block_size=256, metric="eval_custom", tokenized_dataset=tokenized_dataset
     )
     genetic_pruner.fit(model)
-    #path = "procedures/genetic_outputs/attempt_122/59_distilbert.transformer.layer.0.attention.q_lin.weight/generation_9.csv"
-    path = "/Users/sixteoriolllenassegura/prune_llm/marenostrum_layerwise/attempt_122/59_distilbert.transformer.layer.0.attention.q_lin.weight/generation_9.csv"
-    genetic_pruner.initialize(population_size=30, weight=4, best = path)
+    genetic_pruner.initialize(population_size=90, weight=3)
 
-    for layer_name in genetic_pruner.layer_names[::-1]:
+    for layer_name in genetic_pruner.layer_names[:12]:
         genetic_pruner.evolve(
-            population_size=30,
+            population_size=40,
             mutation_rate=0.1,
             n_generations=3,
-            select_n_best=10,
+            select_n_best=25,
             elitism_rate=2,
-            weight=4,
-            layer_name=layer_name,
+            weight=3,
+            masking=layer_name
         )
-    '''
+
+    for layer_name in genetic_pruner.layer_names[-12:]:
+        genetic_pruner.evolve(
+            population_size=40,
+            mutation_rate=0.1,
+            n_generations=3,
+            select_n_best=25,
+            elitism_rate=2,
+            weight=3,
+            masking=layer_name
+        )
+
+
+    for layer_name in genetic_pruner.layer_names:
+        genetic_pruner.evolve(
+            population_size=40,
+            mutation_rate=0.1,
+            n_generations=3,
+            select_n_best=25,
+            elitism_rate=2,
+            weight=3,
+            masking=layer_name
+        )
+
+    for layer_name in genetic_pruner.layer_names[:12]:
+        genetic_pruner.evolve(
+            population_size=40,
+            mutation_rate=0.1,
+            n_generations=3,
+            select_n_best=25,
+            elitism_rate=2,
+            weight=3,
+            masking=layer_name
+        )
+
+    for layer_name in genetic_pruner.layer_names[-12:]:
+        genetic_pruner.evolve(
+            population_size=40,
+            mutation_rate=0.1,
+            n_generations=3,
+            select_n_best=25,
+            elitism_rate=2,
+            weight=3,
+            masking=layer_name
+        )
+
+    for layer_name in genetic_pruner.layer_names:
+        genetic_pruner.evolve(
+            population_size=40,
+            mutation_rate=0.1,
+            n_generations=3,
+            select_n_best=25,
+            elitism_rate=2,
+            weight=3,
+            masking=layer_name
+        )
+
 if __name__ == "__main__":
     main()
