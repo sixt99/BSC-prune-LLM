@@ -23,9 +23,11 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(obj, np.int64):
             return int(obj)
         if isinstance(obj, np.ndarray):
+            if obj.dtype == 'bool':
+                obj = obj.astype(int)
             return str(list(obj))
         if isinstance(obj, list):
-            return str(obj)
+            return str(obj).replace(' ', '')
         return super(NpEncoder, self).default(obj)
 
 
@@ -363,7 +365,7 @@ class GeneticPruner:
         df.loc[len(df)] = self.best_individual
 
         # Create a population by randomly pruning the selected layer
-        for _ in range(self.population_size - 1):
+        while len(df) <= self.population_size:
             genes = np.array(self.best_individual["genes"].copy())
             np.random.seed(uuid.uuid4().int % 2**32)
             # Create individuals with different pruning probabilities
@@ -510,7 +512,8 @@ class GeneticPruner:
         trainer.fit(model, output_path = './')
         trainer.train(threshold)
         self.model = trainer.best_model
-        self.fixed_mask = self.mask
+        self.fixed_mask = (1 - self.mask).astype(bool)
+        self.best_individual = self.evaluate_genes(self, self.best_individual['genes'])
 
 
 class GeneticTrainer:
