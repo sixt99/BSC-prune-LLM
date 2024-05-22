@@ -466,13 +466,9 @@ class GeneticPruner:
         mutated_genes = genes.copy()
         n_ones = np.sum(genes).astype(int)
         n_zeros = len(genes) - n_ones
-        print(n_ones)
-        print(n_zeros)
-        if n_zeros == 0:
-            print(genes)
         p = self.mutation_rate
         ratio = 4
-        balance = (n_ones / n_zeros) * (ratio - 1 + p)
+        balance = 0 if n_zeros == 0 else (n_ones / n_zeros) * (ratio - 1 + p)
         for idx, x in enumerate(mutated_genes):
             np.random.seed(uuid.uuid4().int % 2**32)
 
@@ -512,8 +508,8 @@ class GeneticPruner:
         trainer.fit(model, output_path = './')
         trainer.train(threshold)
         self.model = trainer.best_model
-        self.fixed_mask = (1 - self.mask).astype(bool)
-        self.best_individual = self.evaluate_genes(self, self.best_individual['genes'])
+        self.fixed_mask = (1 - np.array(self.best_individual['genes'])).astype(bool)
+        self.best_individual = self.evaluate_genes(self.best_individual['genes'])
 
 
 class GeneticTrainer:
@@ -659,21 +655,21 @@ def main():
     model = load_model()
     genetic_pruner = GeneticPruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data())
     genetic_pruner.fit(model = model)
-    genetic_pruner.initialize(population_size=20, weight=3)
-    genetic_pruner.train()
+    genetic_pruner.initialize(population_size=20, weight=2)
+    genetic_pruner.train(num_epochs=3)
     
     for layer_name in genetic_pruner.layer_names[-6:]:
         genetic_pruner.evolve(
-            population_size=50,
+            population_size=30,
             mutation_rate=0.1,
             n_generations=3,
-            select_n_best=15,
+            select_n_best=10,
             elitism_rate=2,
             weight=1/4,
             masking=layer_name
         )
 
-    genetic_pruner.train()
+    genetic_pruner.train(num_epochs=3)
 
     for layer_name in genetic_pruner.layer_names[-12:]:
         genetic_pruner.evolve(
