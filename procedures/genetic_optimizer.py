@@ -124,6 +124,7 @@ class GeneticPruner:
 
         # Set a general mask for now
         self.mask = np.ones(self.total_n_blocks).astype(bool)
+        self.fixed_mask = np.ones(self.total_n_blocks).astype(bool)
 
     def create_attempt_folder(self):
         # If output_path does not exist, create it
@@ -291,8 +292,8 @@ class GeneticPruner:
 
                 # ----- CROSSOVER -----
                 i, j = np.random.choice(best_idxs, 2, replace=False)
-                genes1 = np.array(df.loc[i, "genes"])[self.mask]
-                genes2 = np.array(df.loc[j, "genes"])[self.mask]
+                genes1 = np.array(df.loc[i, "genes"])[self.mask * self.fixed_mask]
+                genes2 = np.array(df.loc[j, "genes"])[self.mask * self.fixed_mask]
                 offspring = self.crossover(genes1, genes2)
                 #offspring = self.crossover_layer_wise(genes1, genes2)
 
@@ -301,8 +302,9 @@ class GeneticPruner:
 
                 # Create new genes and add them to the dataset
                 genes_new = np.array(list(self.best_individual["genes"])).copy()
-                genes_new[self.mask] = mutated_offspring
+                genes_new[self.mask * self.fixed_mask] = mutated_offspring
 
+                # If we already have this individual, try again
                 if self.avoid_repeated_individuals and genes_new.tolist() in df_new['genes'].apply(list).tolist():
                     continue
 
@@ -367,7 +369,7 @@ class GeneticPruner:
             # Create individuals with different pruning probabilities
             # That is, we will have individuals with different densities of ones
             pruning_probability = np.random.uniform(0.05, 0.7)
-            genes[self.mask] = np.random.binomial(1, pruning_probability, np.sum(self.mask))
+            genes[self.mask * self.fixed_mask] = np.random.binomial(1, pruning_probability, np.sum(self.mask * self.fixed_mask))
 
             if self.avoid_repeated_individuals and genes.tolist() in df['genes'].apply(list).tolist():
                 continue
@@ -460,18 +462,22 @@ class GeneticPruner:
 
     def mutate(self, genes):
         mutated_genes = genes.copy()
+        n_ones = np.sum(genes).astype(int)
+        n_zeros = len(genes) - n_ones
+        print(n_ones)
+        print(n_zeros)
+        if n_zeros == 0:
+            print(genes)
         p = self.mutation_rate
-        if len(mutated_genes) - np.sum(mutated_genes) == 0:
-            r = 0
-        else:
-            r = np.sum(mutated_genes) / (len(mutated_genes) - np.sum(mutated_genes))
+        ratio = 4
+        balance = (n_ones / n_zeros) * (ratio - 1 + p)
         for idx, x in enumerate(mutated_genes):
             np.random.seed(uuid.uuid4().int % 2**32)
 
             # If x == 1, swap value with probability mutation_rate
-            # If x == 0, swap value with probability (n. ones / n. zeros) * mutation_rate
+            # If x == 0, swap value with probability (balance) * mutation_rate
             # This modification pretends to balance generation of blocks
-            if np.random.random() <= r * p * (1 - x) + p * x:
+            if np.random.random() <= balance * (1 - x) + p * x:
                 mutated_genes[idx] = 1 - mutated_genes[idx]
 
         return mutated_genes
@@ -494,6 +500,18 @@ class GeneticPruner:
             # Numerator rescales metric so that its values go from 0 to 1
             return (1 + self.weight) / (1 / pruned_area + self.weight / matthews)
         
+    def train(self, num_epochs = 3, threshold = 1):
+        print('Training...')
+        model = copy.deepcopy(self.model)
+        genes = self.best_individual['genes']
+        self.prune_model_by_genes(model, genes)
+
+        trainer = GeneticTrainer(num_epochs)
+        trainer.fit(model, output_path = './')
+        trainer.train(threshold)
+        self.model = trainer.best_model
+        self.fixed_mask = self.mask
+
 
 class GeneticTrainer:
     def __init__(self, num_epochs):
@@ -515,11 +533,12 @@ class GeneticTrainer:
         self.lr_scheduler = None
         self.progress_bar = None
         self.best_model = None
+        self.num_training_steps = None
 
     def fit(self, model, output_path):
         self.model = model
         self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
-        self.trainer = load_trainer(model)
+        self.trainer = load_trainer(self.model)
         self.tokenizer = load_tokenizer()
         self.tokenized_dataset = load_tokenized_data(self.tokenizer)
         self.output_path = output_path
@@ -528,7 +547,7 @@ class GeneticTrainer:
         self.tokenized_dataset = self.tokenized_dataset.remove_columns(["sentence", "idx"])
         self.tokenized_dataset = self.tokenized_dataset.rename_column("label", "labels")
         self.tokenized_dataset.set_format("torch")
-        train_data = self.tokenized_dataset["train"]#.shuffle(seed=42).select(range(100))
+        train_data = self.tokenized_dataset["train"].shuffle(seed=42)
         eval_data = self.tokenized_dataset["validation"]#.shuffle(seed=42).select(range(100))
 
         self.data_collator = DataCollatorWithPadding(self.tokenizer)
@@ -545,21 +564,27 @@ class GeneticTrainer:
         # Device
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
 
-        # Progress bar and scheduler
-        num_training_steps = self.num_epochs * len(self.train_dataloader)
-        self.progress_bar = tqdm(range(num_training_steps))
+        # Scheduler
+        self.num_training_steps = self.num_epochs * len(self.train_dataloader)
         self.lr_scheduler = get_scheduler(
-            name="linear", optimizer=self.optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
+            name="linear", optimizer=self.optimizer, num_warmup_steps=0, num_training_steps=self.num_training_steps
         )
         
     def evaluate(self):
-        self.model.eval() # Set evaluation mode
+        self.model.eval() # Set the model to evaluation mode
         for batch in self.eval_dataloader:
+            # Move the batch data to the specified device (CPU, MPS or GPU)
             batch = {k: v.to(self.device) for k, v in batch.items()}
+            
+            # Disable gradient calculation for evaluation
             with torch.no_grad():
-                outputs = self.model(**batch)
+                outputs = self.model(**batch) # Forward pass: compute model outputs
+            
+            # Compute predicted labels by taking the argmax over the logits
             logits = outputs.logits
             predictions = torch.argmax(logits, dim=-1)
+            
+            # Update each metric with the current batch of predictions and references (true labels)
             for name in self.metric_names:
                 self.metrics[name].add_batch(predictions=predictions, references=batch["labels"])
 
@@ -567,119 +592,98 @@ class GeneticTrainer:
             self.results.update(self.metrics[name].compute())
 
     def train_step(self):
-        self.model.train() # Set training mode
+        self.model.train() # Set the model to training mode
         for batch in self.train_dataloader:
+            # Move the batch data to the specified device (CPU, MPS, or GPU)
             batch = {k: v.to(self.device) for k, v in batch.items()}
-            outputs = self.model(**batch)
-            loss = outputs.loss
-            loss.backward()
-
-            # Set grads of blocks to zero
+            
+            outputs = self.model(**batch) # Forward pass: compute model outputs
+            loss = outputs.loss # Extract the loss from the model outputs
+            loss.backward() # Backward pass: compute gradients
+            
+            # Set gradients of blocks to zero
             for name, param in self.model.named_parameters():
-                if len(param.shape) == 2 and param.requires_grad:
-                    param.grad[param.cpu().detach().numpy()==0] = 0
+                if len(param.shape) == 2 and param.requires_grad:  # Check if the parameter is a 2D tensor and requires gradients
+                    param.grad[param.cpu().detach().numpy() == 0] = 0
 
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.optimizer.zero_grad()
-            self.progress_bar.update(1)
-
-    def train(self, layer_list, threshold = 1):
-        # Freeze those layers whose pruning ratio is higher or equal than threshold
-        # In other words, train only using least pruned layers
-        for param in self.model.distilbert.parameters():
-            tensor = param.cpu().detach().numpy()
-            if len(tensor.shape) == 2 and np.sum(tensor == 0) / (tensor.shape[0] * tensor.shape[1]) >= threshold:
-                param.requires_grad = False
-
-        # Start training
-        # TODO FER QUE EL EVALUATE RETORNI COSES
-        print('Initial model evaluation:')
-        self.evaluate()
-        best_metric = self.results['matthews_correlation']
-
-        for epoch in range(self.num_epochs):
-            self.train_step()
-            self.evaluate()
-            print(self.results)
-            if best_metric < self.results['matthews_correlation']:
-                self.best_metric = self.results['matthews_correlation']
-                self.best_model = copy.deepcopy(self.model)
-
-        # After finishing, save BEST model
-        self.save_best()
+            self.optimizer.step() # Update model parameters based on gradients
+            self.lr_scheduler.step() # Update learning rate based on the scheduler
+            self.optimizer.zero_grad() # Reset gradients for the next iteration
+            self.progress_bar.update(1) # Update the progress bar
 
     def save_best(self):
         # Create output path in case it does not exist
         if not os.path.exists(self.output_path):
             os.mkdir(self.output_path)
+
         # See how many saved models there are already and add the next folder
         n_models = np.max([int(x.split('model_')[1]) for x in os.listdir(self.output_path) if x.startswith('model_')]).astype(int)
         self.best_model.save_pretrained(self.output_path + f'model_{n_models + 1}')
 
+    def train(self, threshold = 1, save = False):
+        # Freeze those layers whose pruning ratio is higher or equal than threshold
+        # In other words, train only using least pruned layers
+        # TODO MIRAR MÉS AVIAT LA MÀSCARA, NO ELS ELEMENTS QUE SIGUIN ZERO
+        if 0 <= threshold < 1:
+            for param in self.model.distilbert.parameters():
+                tensor = param.cpu().detach().numpy()
+                if len(tensor.shape) == 2 and np.sum(tensor == 0) / (tensor.shape[0] * tensor.shape[1]) >= threshold:
+                    param.requires_grad = False
+
+        # Start training
+        # TODO FER QUE EL EVALUATE RETORNI COSES
+        self.evaluate()
+        print('Initial model evaluation:')
+        print(self.results)
+        self.best_metric = self.results['matthews_correlation']
+        self.best_model = self.model
+
+        self.progress_bar = tqdm(range(self.num_training_steps))
+        for _ in range(self.num_epochs):
+            self.train_step()
+            self.evaluate()
+            print(self.results)
+            if self.best_metric < self.results['matthews_correlation']:
+                self.best_metric = self.results['matthews_correlation']
+                self.best_model = copy.deepcopy(self.model)
+
+        # After finishing, save BEST model
+        if save:
+            self.save_best()
+
 
 def main():
-    '''
     model = load_model()
-    pruner = GeneticPruner(block_size=256, metric='eval_custom', tokenized_dataset=load_tokenized_data())
-    pruner.fit(model = model)
-    pruner.prune_model_by_genes(model, genes = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,0,0,1,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,1,0,0,0,0,0,1,0,1,0,1,1,0,0,0,1,1,1,0,1,1,0,0,0,0,0,1,1,1,1,0,0,0,1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,1,0,0,0,0,1,0,0,1,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,1,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,1,0,1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,1,1,0,1,1,1,1,1,0,0,0,0,1,1,1,1,0,1,1,1,0,1,0,0,1,1,1,1,1,0,1,1,1,1,1,1,1,0,1,0,0,1,0,1,1,1,1,0,0,0,1,1,1,1,0,1,0,0,0,1,0,0,0,0,0,1,0,1,0,1,0,0,0,1,1,1,1,1,1,0,0,0,1,1,1,1,1,1,0,1,0,1,1,0,0,1,0,0,1,1,0,1,1,0,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,0,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,0,0])
-
-    trainer = GeneticTrainer(num_epochs=6)
-    trainer.fit(model, output_path = './')
-    trainer.train(threshold = 1, layer_list=pruner.layer_names)
-    '''
-
-    # Initialize model and get some information about the pruning
-    model = load_model()
-    tokenized_dataset = load_tokenized_data()
-    genetic_pruner = GeneticPruner(
-        block_size=128, metric="eval_custom", tokenized_dataset=tokenized_dataset
-    )
-    genetic_pruner.fit(model)
-    genetic_pruner.initialize(population_size=200, weight=3)
-
-    for layer_name in genetic_pruner.layer_names[:6]:
-        genetic_pruner.evolve(
-            population_size=50,
-            mutation_rate=0.1,
-            n_generations=4,
-            select_n_best=15,
-            elitism_rate=2,
-            weight=3,
-            masking=layer_name
-        )
+    genetic_pruner = GeneticPruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data())
+    genetic_pruner.fit(model = model)
+    genetic_pruner.initialize(population_size=20, weight=3)
+    genetic_pruner.train()
+    
     for layer_name in genetic_pruner.layer_names[-6:]:
         genetic_pruner.evolve(
             population_size=50,
             mutation_rate=0.1,
-            n_generations=4,
+            n_generations=3,
             select_n_best=15,
             elitism_rate=2,
-            weight=3,
+            weight=1/4,
             masking=layer_name
         )
 
-    for layer_name in genetic_pruner.layer_names[:12]:
-        genetic_pruner.evolve(
-            population_size=50,
-            mutation_rate=0.1,
-            n_generations=4,
-            select_n_best=15,
-            elitism_rate=2,
-            weight=3,
-            masking=layer_name
-        )
+    genetic_pruner.train()
+
     for layer_name in genetic_pruner.layer_names[-12:]:
         genetic_pruner.evolve(
             population_size=50,
             mutation_rate=0.1,
-            n_generations=4,
+            n_generations=3,
             select_n_best=15,
             elitism_rate=2,
-            weight=3,
+            weight=1/2,
             masking=layer_name
         )
+
+    genetic_pruner.train()
 
     for layer_name in genetic_pruner.layer_names:
         genetic_pruner.evolve(
@@ -688,9 +692,22 @@ def main():
             n_generations=4,
             select_n_best=15,
             elitism_rate=2,
-            weight=3,
+            weight=1,
             masking=layer_name
         )
+
+    for layer_name in genetic_pruner.layer_names[::-1]:
+        genetic_pruner.evolve(
+            population_size=50,
+            mutation_rate=0.1,
+            n_generations=4,
+            select_n_best=15,
+            elitism_rate=2,
+            weight=1,
+            masking=layer_name
+        )
+
+    genetic_pruner.train()
 
 if __name__ == "__main__":
     main()
