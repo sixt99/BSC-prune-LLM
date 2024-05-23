@@ -635,7 +635,7 @@ class GeneticTrainer:
             # See how many folders there are in the current attempt and create a new one
             folder_idxs = [int(x.split("_")[0]) for x in os.listdir(self.attempt_path) if x.__contains__('_')]
             n = max(folder_idxs) + 1 if folder_idxs else 0
-            self.best_model.save_pretrained(f'{n + 1}_training')
+            self.best_model.save_pretrained(self.attempt_path + f'/{n}_training')
 
     def train(self, threshold = 1, save = True):
         # Freeze those layers whose pruning ratio is higher or equal than threshold
