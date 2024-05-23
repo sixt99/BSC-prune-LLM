@@ -411,7 +411,7 @@ class GeneticPruner:
 
         # Prune the model given the genes
         n_blocks_per_layer = self.prune_model_by_genes(model, genes)
-        evaluation = trainer.evaluate(self.tokenized_dataset["train"])
+        evaluation = trainer.evaluate(self.tokenized_dataset[dataset])
         evaluation["pruned_area"] = np.sum(n_blocks_per_layer) / self.total_n_blocks
 
         # Add geometric mean
