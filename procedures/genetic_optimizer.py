@@ -133,7 +133,7 @@ class GeneticPruner:
         if not os.path.exists(self.output_path):
             os.mkdir(self.output_path)
 
-        # Get the list of existing attempts in out output_path
+        # Get the list of existing attempts in output_path
         folder_idxs = []
         for x in os.listdir(self.output_path):
             if x.startswith("attempt_"):
@@ -148,7 +148,14 @@ class GeneticPruner:
     def create_layer_folder(self):
         print(f"\nOptimizing layer: {self.layer_name}")
         
+        # Get the list of existing layer-iterations in attempt_path
+        folder_idxs = []
+        for x in os.listdir(self.attempt_path):
+            if x.__contains__('_'):
+                folder_idxs.append(int(x.split("_")[0]))
+
         # Create a new layer-iteration
+        self.folder_counter = max(folder_idxs) + 1 if folder_idxs else 0
         self.layer_path = (
             self.attempt_path + f"/{str(self.folder_counter)}_{self.layer_name}"
         )
@@ -467,7 +474,7 @@ class GeneticPruner:
         n_ones = np.sum(genes).astype(int)
         n_zeros = len(genes) - n_ones
         p = self.mutation_rate
-        ratio = 4
+        ratio = 3
         balance = 0 if n_zeros == 0 else (n_ones / n_zeros) * (ratio - 1 + p)
         for idx, x in enumerate(mutated_genes):
             np.random.seed(uuid.uuid4().int % 2**32)
@@ -505,7 +512,7 @@ class GeneticPruner:
         self.prune_model_by_genes(model, genes)
 
         trainer = GeneticTrainer(num_epochs)
-        trainer.fit(model, output_path = './')
+        trainer.fit(model, output_path = self.attempt_path)
         trainer.train(threshold)
         self.model = trainer.best_model
         self.fixed_mask = (1 - np.array(self.best_individual['genes'])).astype(bool)
@@ -516,15 +523,10 @@ class GeneticTrainer:
     def __init__(self, num_epochs):
         self.num_epochs = num_epochs
         self.model = None
+        self.output_path = None
         self.optimizer = None
-        self.training_arguments = None
-        self.trainer = None
-        self.tokenizer = None
-        self.tokenized_dataset = None
-        self.data_collator = None
         self.train_dataloader = None
         self.eval_dataloader = None
-        self.output_path = None
         self.metric_names = None
         self.metrics = None
         self.results = None
@@ -536,22 +538,20 @@ class GeneticTrainer:
 
     def fit(self, model, output_path):
         self.model = model
-        self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
-        self.trainer = load_trainer(self.model)
-        self.tokenizer = load_tokenizer()
-        self.tokenized_dataset = load_tokenized_data(self.tokenizer)
         self.output_path = output_path
+        self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
 
-        # Perform some adjustments tailored for this model
-        self.tokenized_dataset = self.tokenized_dataset.remove_columns(["sentence", "idx"])
-        self.tokenized_dataset = self.tokenized_dataset.rename_column("label", "labels")
-        self.tokenized_dataset.set_format("torch")
-        train_data = self.tokenized_dataset["train"].shuffle(seed=42)
-        eval_data = self.tokenized_dataset["validation"]#.shuffle(seed=42).select(range(100))
-
-        self.data_collator = DataCollatorWithPadding(self.tokenizer)
-        self.train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=self.data_collator)
-        self.eval_dataloader = DataLoader(eval_data, batch_size=8, collate_fn=self.data_collator)
+        # Load self.train_dataloader and self.eval_dataloader
+        tokenizer = load_tokenizer()
+        tokenized_dataset = load_tokenized_data(tokenizer)
+        tokenized_dataset = tokenized_dataset.remove_columns(["sentence", "idx"])
+        tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
+        tokenized_dataset.set_format("torch")
+        train_data = tokenized_dataset["train"]#.shuffle(seed=42).select(range(100))
+        eval_data = tokenized_dataset["validation"]#.shuffle(seed=42).select(range(100))
+        data_collator = DataCollatorWithPadding(tokenizer)
+        self.train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=data_collator)
+        self.eval_dataloader = DataLoader(eval_data, batch_size=8, collate_fn=data_collator)
 
         # Metrics
         self.metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
@@ -616,10 +616,10 @@ class GeneticTrainer:
             os.mkdir(self.output_path)
 
         # See how many saved models there are already and add the next folder
-        n_models = np.max([int(x.split('model_')[1]) for x in os.listdir(self.output_path) if x.startswith('model_')]).astype(int)
-        self.best_model.save_pretrained(self.output_path + f'model_{n_models + 1}')
+        n = np.max([int(x.split('_')[0]) for x in os.listdir(self.output_path) if x.__contains__('_')]).astype(int)
+        self.best_model.save_pretrained(self.output_path + f'{n + 1}_training')
 
-    def train(self, threshold = 1, save = False):
+    def train(self, threshold = 1, save = True):
         # Freeze those layers whose pruning ratio is higher or equal than threshold
         # In other words, train only using least pruned layers
         # TODO MIRAR MÉS AVIAT LA MÀSCARA, NO ELS ELEMENTS QUE SIGUIN ZERO
@@ -656,33 +656,20 @@ def main():
     genetic_pruner = GeneticPruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data())
     genetic_pruner.fit(model = model)
     genetic_pruner.initialize(population_size=20, weight=2)
-    genetic_pruner.train(num_epochs=3)
+    genetic_pruner.train(num_epochs=4)
     
-    for layer_name in genetic_pruner.layer_names[-6:]:
+    for layer_name in genetic_pruner.layer_names[-12:]:
         genetic_pruner.evolve(
-            population_size=30,
+            population_size=20,
             mutation_rate=0.1,
             n_generations=3,
             select_n_best=10,
-            elitism_rate=2,
-            weight=1/4,
-            masking=layer_name
-        )
-
-    genetic_pruner.train(num_epochs=3)
-
-    for layer_name in genetic_pruner.layer_names[-12:]:
-        genetic_pruner.evolve(
-            population_size=50,
-            mutation_rate=0.1,
-            n_generations=3,
-            select_n_best=15,
             elitism_rate=2,
             weight=1/2,
             masking=layer_name
         )
 
-    genetic_pruner.train()
+    genetic_pruner.train(num_epochs=3)
 
     for layer_name in genetic_pruner.layer_names:
         genetic_pruner.evolve(
@@ -695,6 +682,8 @@ def main():
             masking=layer_name
         )
 
+    genetic_pruner.train(num_epochs=4)
+
     for layer_name in genetic_pruner.layer_names[::-1]:
         genetic_pruner.evolve(
             population_size=50,
@@ -706,7 +695,7 @@ def main():
             masking=layer_name
         )
 
-    genetic_pruner.train()
+    genetic_pruner.train(num_epochs=4)
 
 if __name__ == "__main__":
     main()
