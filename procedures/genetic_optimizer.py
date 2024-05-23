@@ -281,6 +281,7 @@ class GeneticPruner:
             # In the next generations, create a new one by starting from the best individuals of the last
             df_new = df.loc[best_idxs].reset_index(drop=True)
 
+            counter = 0
             # Repeat as many times as needed to reach a population of size self.population_size
             while len(df_new) <= self.population_size:
                 np.random.seed(uuid.uuid4().int % 2**32)
@@ -301,7 +302,12 @@ class GeneticPruner:
 
                 # If we already have this individual, try again
                 if self.avoid_repeated_individuals and genes_new.tolist() in df_new['genes'].apply(list).tolist():
-                    continue
+                    if counter < self.population_size:
+                        counter += 1
+                        continue
+                    else: # Too many attempts
+                        print(f'Attention: keeping generation with {len(df)} individuals instead of {self.population_size}')
+                        break
 
                 evaluation = self.evaluate_genes(genes_new)
                 df_new.loc[len(df_new)] = evaluation
@@ -357,6 +363,7 @@ class GeneticPruner:
         df = pd.DataFrame(columns=self.columns)
         df.loc[len(df)] = self.best_individual
 
+        counter = 0
         # Create a population by randomly pruning the selected layer
         while len(df) <= self.population_size:
             genes = np.array(self.best_individual["genes"].copy())
@@ -367,7 +374,12 @@ class GeneticPruner:
             genes[self.mask * self.fixed_mask] = np.random.binomial(1, pruning_probability, np.sum(self.mask * self.fixed_mask))
 
             if self.avoid_repeated_individuals and genes.tolist() in df['genes'].apply(list).tolist():
-                continue
+                if counter < self.population_size:
+                    counter += 1
+                    continue
+                else: # Too many attempts
+                    print(f'Attention: randomly populating with {len(df)} individuals instead of {self.population_size}')
+                    break
 
             evaluation = self.evaluate_genes(genes)
             df.loc[len(df)] = evaluation
@@ -608,7 +620,7 @@ class GeneticTrainer:
 
     def train(self, threshold = 1, save = True):
         # Freeze those layers whose pruning ratio is higher or equal than threshold
-        # In other words, train only using least pruned layers
+        # In other words, train only least pruned layers
         # TODO MIRAR MÉS AVIAT LA MÀSCARA, NO ELS ELEMENTS QUE SIGUIN ZERO
         if 0 <= threshold < 1:
             for param in self.model.distilbert.parameters():
