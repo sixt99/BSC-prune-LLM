@@ -209,10 +209,11 @@ class GeneticPruner:
         print(best_individual_so_far)
 
         # Print BEST INDIVIDUAL evaluated on validation data
-        self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
         print(f"Best individual so far evaluated on VALIDATION:")
+        self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
+        self.best_individual_validation = {key : self.best_individual_validation[key] for key in self.log_metrics}
         best_individual_so_far_val = json.dumps(
-            self.best_individual_validation.loc[self.log_metrics].to_dict(),
+            self.best_individual_validation,
             indent=4,
         )
         print(best_individual_so_far_val)
@@ -524,7 +525,7 @@ class GeneticPruner:
         self.prune_model_by_genes(model, genes)
 
         trainer = GeneticTrainer(num_epochs)
-        trainer.fit(model, output_path = self.attempt_path)
+        trainer.fit(model, self.attempt_path)
         trainer.train(threshold)
         self.model = trainer.best_model
         self.fixed_mask = (1 - np.array(self.best_individual['genes'])).astype(bool)
@@ -550,6 +551,7 @@ class GeneticTrainer:
 
     def fit(self, model, attempt_path):
         self.model = model
+        load_trainer(model)
         self.attempt_path = attempt_path
         self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
 
@@ -559,7 +561,7 @@ class GeneticTrainer:
         tokenized_dataset = tokenized_dataset.remove_columns(["sentence", "idx"])
         tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
         tokenized_dataset.set_format("torch")
-        train_data = tokenized_dataset["train"]#.shuffle(seed=42).select(range(100))
+        train_data = tokenized_dataset["train"].shuffle(seed=42).select(range(400))
         eval_data = tokenized_dataset["validation"]#.shuffle(seed=42).select(range(100))
         data_collator = DataCollatorWithPadding(tokenizer)
         self.train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=data_collator)
@@ -598,7 +600,10 @@ class GeneticTrainer:
             for name in self.metric_names:
                 self.metrics[name].add_batch(predictions=predictions, references=batch["labels"])
 
-        evaluation = {self.metrics[name].compute() for name in self.metric_names}
+        evaluation = {}
+        for name in self.metric_names:
+            evaluation.update(self.metrics[name].compute())
+
         return evaluation
 
     def train_step(self):
@@ -630,7 +635,7 @@ class GeneticTrainer:
             # See how many folders there are in the current attempt and create a new one
             folder_idxs = [int(x.split("_")[0]) for x in os.listdir(self.attempt_path) if x.__contains__('_')]
             n = max(folder_idxs) + 1 if folder_idxs else 0
-            self.best_model.save_pretrained(self.attempt_path + f'{n + 1}_training')
+            self.best_model.save_pretrained(f'{n + 1}_training')
 
     def train(self, threshold = 1, save = True):
         # Freeze those layers whose pruning ratio is higher or equal than threshold
@@ -668,14 +673,14 @@ def main():
     model = load_model()
     genetic_pruner = GeneticPruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data())
     genetic_pruner.fit(model)
-    genetic_pruner.initialize(population_size=50, weight=1)
+    genetic_pruner.initialize(population_size=10, weight=1)
     genetic_pruner.train(num_epochs=4)
     
-    for layer_name in genetic_pruner.layer_names[-12:]:
+    for layer_name in genetic_pruner.layer_names[-1:]:
         genetic_pruner.evolve(
             population_size=20,
             mutation_rate=0.1,
-            n_generations=3,
+            n_generations=2,
             select_n_best=10,
             elitism_rate=2,
             weight=1/2,
@@ -684,12 +689,12 @@ def main():
 
     genetic_pruner.train(num_epochs=3)
 
-    for layer_name in genetic_pruner.layer_names:
+    for layer_name in genetic_pruner.layer_names[:12]:
         genetic_pruner.evolve(
-            population_size=50,
+            population_size=20,
             mutation_rate=0.1,
             n_generations=4,
-            select_n_best=15,
+            select_n_best=10,
             elitism_rate=2,
             weight=1,
             masking=layer_name
