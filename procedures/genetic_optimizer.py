@@ -25,7 +25,7 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             if obj.dtype == 'bool':
                 obj = obj.astype(int)
-            return str(list(obj))
+            return str(list(obj)).replace(' ', '')
         if isinstance(obj, list):
             return str(obj).replace(' ', '')
         return super(NpEncoder, self).default(obj)
@@ -50,6 +50,7 @@ class GeneticPruner:
         self.mask = None
         self.fixed_mask = None
         self.best_individual = None
+        self.best_individual_validation = None
         self.columns = [
             "eval_loss",
             "eval_accuracy",
@@ -72,13 +73,11 @@ class GeneticPruner:
             "eval_gm",
             "eval_custom"
         ]
-
         self.model = None
         self.layer_names = None
         self.grid_shapes = None
         self.blocks_per_layer = None
         self.total_n_blocks = None
-
         self.population_size = None
         self.mutation_rate = None
         self.n_generations = None
@@ -200,6 +199,27 @@ class GeneticPruner:
                 index=False,
             )
 
+    def evaluate_best(self):
+        # Print BEST INDIVIDUAL
+        print(f"Best individual so far evaluated on TRAIN:")
+        best_individual_so_far = json.dumps(
+            self.best_individual.loc[self.log_metrics].to_dict(),
+            indent=4,
+        )
+        print(best_individual_so_far)
+
+        # Print BEST INDIVIDUAL evaluated on validation data
+        self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
+        print(f"Best individual so far evaluated on VALIDATION:")
+        best_individual_so_far_val = json.dumps(
+            self.best_individual_validation.loc[self.log_metrics].to_dict(),
+            indent=4,
+        )
+        print(best_individual_so_far_val)
+
+        # Save configuration of this step in a .json
+        self.dump_parameter_configuration()
+
     def evolve(self, population_size, mutation_rate, n_generations, select_n_best, elitism_rate, weight, masking):
         self.population_size = population_size
         self.mutation_rate = mutation_rate
@@ -219,6 +239,9 @@ class GeneticPruner:
         self.create_layer_folder()
         self.evolve_()
 
+        # Evaluate on train and validation
+        self.evaluate_best()
+        
     def set_mask(self, masking):
         # Case 1:
         # no specific masking is applied
@@ -336,13 +359,6 @@ class GeneticPruner:
 
         # After finishing all the generations, this layer has been optimized
         self.best_individual = df.loc[np.argmax(df[self.metric].tolist())]
-        print(f"Best individual so far:")
-        best_individual_so_far = json.dumps(
-            self.best_individual.loc[self.log_metrics].to_dict(),
-            indent=4,
-        )
-        print(best_individual_so_far)
-        self.dump_parameter_configuration()
 
     def dump_parameter_configuration(self):
         # Create a copy of the current class and dump it to a .json file
@@ -387,7 +403,7 @@ class GeneticPruner:
         # Return the generation 0
         return df
 
-    def evaluate_genes(self, genes):
+    def evaluate_genes(self, genes, dataset = "train"):
         # Do not modify the model in the class
         model = copy.deepcopy(self.model)
         trainer = load_trainer(model)
@@ -472,7 +488,7 @@ class GeneticPruner:
         n_ones = np.sum(genes).astype(int)
         n_zeros = len(genes) - n_ones
         p = self.mutation_rate
-        ratio = 3
+        ratio = 1.2
         balance = 0 if n_zeros == 0 else (n_ones / n_zeros) * (ratio - 1 + p)
         for idx, x in enumerate(mutated_genes):
             np.random.seed(uuid.uuid4().int % 2**32)
@@ -489,14 +505,12 @@ class GeneticPruner:
         return list(map(int, string[1:-1].split(", ")))
 
     def gm(self, pruned_area, matthews):
-        # Avoid division by zero
         if pruned_area == 0 or matthews <= 0:
             return 0
         else:
             return 2 / (1 / pruned_area + 1 / matthews)
         
     def custom(self, pruned_area, matthews):
-        # Avoid division by zero
         if pruned_area == 0 or matthews <= 0:
             return 0
         else:
@@ -653,8 +667,8 @@ class GeneticTrainer:
 def main():
     model = load_model()
     genetic_pruner = GeneticPruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data())
-    genetic_pruner.fit(model = model)
-    genetic_pruner.initialize(population_size=20, weight=2)
+    genetic_pruner.fit(model)
+    genetic_pruner.initialize(population_size=50, weight=1)
     genetic_pruner.train(num_epochs=4)
     
     for layer_name in genetic_pruner.layer_names[-12:]:
