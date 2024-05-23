@@ -50,7 +50,6 @@ class GeneticPruner:
         self.mask = None
         self.fixed_mask = None
         self.best_individual = None
-        self.folder_counter = 0
         self.columns = [
             "eval_loss",
             "eval_accuracy",
@@ -133,13 +132,8 @@ class GeneticPruner:
         if not os.path.exists(self.output_path):
             os.mkdir(self.output_path)
 
-        # Get the list of existing attempts in output_path
-        folder_idxs = []
-        for x in os.listdir(self.output_path):
-            if x.startswith("attempt_"):
-                folder_idxs.append(int(x.split("_")[1]))
-
-        # Create a new attempt
+        # See how many attempts there are in the current output folder and create a new one
+        folder_idxs = [int(x.split("_")[1]) for x in os.listdir(self.output_path) if x.__contains__('_')]
         self.attempt = max(folder_idxs) + 1 if folder_idxs else 0
         print(f"--------- ATTEMPT {self.attempt} ---------")
         self.attempt_path = self.output_path + f"/attempt_{self.attempt}"
@@ -148,18 +142,10 @@ class GeneticPruner:
     def create_layer_folder(self):
         print(f"\nOptimizing layer: {self.layer_name}")
         
-        # Get the list of existing layer-iterations in attempt_path
-        folder_idxs = []
-        for x in os.listdir(self.attempt_path):
-            if x.__contains__('_'):
-                folder_idxs.append(int(x.split("_")[0]))
-
-        # Create a new layer-iteration
-        self.folder_counter = max(folder_idxs) + 1 if folder_idxs else 0
-        self.layer_path = (
-            self.attempt_path + f"/{str(self.folder_counter)}_{self.layer_name}"
-        )
-        self.folder_counter += 1
+        # See how many folders there are in the current attempt and create a new one
+        folder_idxs = [int(x.split("_")[0]) for x in os.listdir(self.attempt_path) if x.__contains__('_')]
+        n = max(folder_idxs) + 1 if folder_idxs else 0
+        self.layer_path = (self.attempt_path + f"/{n}_{self.layer_name}")
         os.mkdir(self.layer_path)
     
     def initialize(self, population_size, weight, best=None):
@@ -520,25 +506,25 @@ class GeneticPruner:
 
 
 class GeneticTrainer:
-    def __init__(self, num_epochs):
+    def __init__(self, num_epochs, metric = 'matthews_correlation'):
         self.num_epochs = num_epochs
         self.model = None
-        self.output_path = None
+        self.attempt_path = None
         self.optimizer = None
         self.train_dataloader = None
         self.eval_dataloader = None
         self.metric_names = None
         self.metrics = None
-        self.results = None
         self.device = None
         self.lr_scheduler = None
         self.progress_bar = None
         self.best_model = None
         self.num_training_steps = None
+        self.metric = metric
 
-    def fit(self, model, output_path):
+    def fit(self, model, attempt_path):
         self.model = model
-        self.output_path = output_path
+        self.attempt_path = attempt_path
         self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
 
         # Load self.train_dataloader and self.eval_dataloader
@@ -556,7 +542,6 @@ class GeneticTrainer:
         # Metrics
         self.metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
         self.metrics = {}
-        self.results = {}
         for name in self.metric_names:
            self.metrics[name] = load_metric(f'./metrics/{name}')
 
@@ -568,7 +553,7 @@ class GeneticTrainer:
         self.lr_scheduler = get_scheduler(
             name="linear", optimizer=self.optimizer, num_warmup_steps=0, num_training_steps=self.num_training_steps
         )
-        
+
     def evaluate(self):
         self.model.eval() # Set the model to evaluation mode
         for batch in self.eval_dataloader:
@@ -587,8 +572,8 @@ class GeneticTrainer:
             for name in self.metric_names:
                 self.metrics[name].add_batch(predictions=predictions, references=batch["labels"])
 
-        for name in self.metric_names:
-            self.results.update(self.metrics[name].compute())
+        evaluation = {self.metrics[name].compute() for name in self.metric_names}
+        return evaluation
 
     def train_step(self):
         self.model.train() # Set the model to training mode
@@ -611,13 +596,15 @@ class GeneticTrainer:
             self.progress_bar.update(1) # Update the progress bar
 
     def save_best(self):
-        # Create output path in case it does not exist
-        if not os.path.exists(self.output_path):
-            os.mkdir(self.output_path)
+        if self.best_model is not None:
+            # Create attempt path in case it does not exist
+            if not os.path.exists(self.attempt_path):
+                os.mkdir(self.attempt_path)
 
-        # See how many saved models there are already and add the next folder
-        n = np.max([int(x.split('_')[0]) for x in os.listdir(self.output_path) if x.__contains__('_')]).astype(int)
-        self.best_model.save_pretrained(self.output_path + f'{n + 1}_training')
+            # See how many folders there are in the current attempt and create a new one
+            folder_idxs = [int(x.split("_")[0]) for x in os.listdir(self.attempt_path) if x.__contains__('_')]
+            n = max(folder_idxs) + 1 if folder_idxs else 0
+            self.best_model.save_pretrained(self.attempt_path + f'{n + 1}_training')
 
     def train(self, threshold = 1, save = True):
         # Freeze those layers whose pruning ratio is higher or equal than threshold
@@ -629,21 +616,21 @@ class GeneticTrainer:
                 if len(tensor.shape) == 2 and np.sum(tensor == 0) / (tensor.shape[0] * tensor.shape[1]) >= threshold:
                     param.requires_grad = False
 
-        # Start training
-        # TODO FER QUE EL EVALUATE RETORNI COSES
-        self.evaluate()
+        # Initial evaluation
+        evaluation = self.evaluate()
         print('Initial model evaluation:')
-        print(self.results)
-        self.best_metric = self.results['matthews_correlation']
+        print(evaluation)
+        self.best_metric = evaluation[self.metric]
         self.best_model = self.model
 
+        # Start training
         self.progress_bar = tqdm(range(self.num_training_steps))
         for _ in range(self.num_epochs):
             self.train_step()
-            self.evaluate()
-            print(self.results)
-            if self.best_metric < self.results['matthews_correlation']:
-                self.best_metric = self.results['matthews_correlation']
+            evaluation = self.evaluate()
+            print(evaluation)
+            if self.best_metric < evaluation[self.metric]:
+                self.best_metric = evaluation[self.metric]
                 self.best_model = copy.deepcopy(self.model)
 
         # After finishing, save BEST model
