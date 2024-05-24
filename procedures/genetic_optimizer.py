@@ -154,7 +154,7 @@ class GeneticPruner:
         # Create a new attempt
         self.create_attempt_folder()
 
-        # We already have a good individual, so we wish to start from there
+        # We already have a good individual, so we start from there
         # Such individual can be passed as:
         # - a dictionary
         # - the dataset in which it is found
@@ -218,9 +218,6 @@ class GeneticPruner:
         )
         print(best_individual_so_far_val)
 
-        # Save configuration of this step in a .json
-        self.dump_parameter_configuration()
-
     def evolve(self, population_size, mutation_rate, n_generations, select_n_best, elitism_rate, weight, masking):
         self.population_size = population_size
         self.mutation_rate = mutation_rate
@@ -242,6 +239,9 @@ class GeneticPruner:
 
         # Evaluate on train and validation
         self.evaluate_best()
+
+        # Save configuration of this evolve step in a .json
+        self.dump_parameter_configuration()
         
     def set_mask(self, masking):
         # Case 1:
@@ -282,6 +282,10 @@ class GeneticPruner:
         self.mask[a:b] = True
 
     def evolve_(self):
+        if np.all(self.mask * self.fixed_mask == 0):
+            print("(mask && fixed_mask) is zero. Nothing to do here.")
+            return
+
         generation = 0
         while generation < self.n_generations:
             print(f"* Generation {generation}")
@@ -358,7 +362,7 @@ class GeneticPruner:
 
             generation += 1
 
-        # After finishing all the generations, this layer has been optimized
+        # After finishing all the generations, take the best individual found
         self.best_individual = df.loc[np.argmax(df[self.metric].tolist())]
 
     def dump_parameter_configuration(self):
@@ -381,17 +385,34 @@ class GeneticPruner:
         df.loc[len(df)] = self.best_individual
 
         counter = 0
+        iteration = 0
         # Create a population by randomly pruning the selected layer
         while len(df) <= self.population_size:
             genes = np.array(self.best_individual["genes"].copy())
-            np.random.seed(uuid.uuid4().int % 2**32)
+
             # Create individuals with different pruning probabilities
             # That is, we will have individuals with different densities of ones
-            pruning_probability = np.random.uniform(0.05, 0.7)
+            # Be sure to include a chromosome full of ZEROS and a chromosome full of ONES
+            if iteration == 0:
+                pruning_probability = 0
+            elif iteration == 1:
+                pruning_probability = 1
+            else:
+                np.random.seed(uuid.uuid4().int % 2**32)
+                pruning_probability = np.random.uniform(0, 1)
+                print('pruning_probability:', pruning_probability)
+
+            iteration += 1
+
+            np.random.seed(uuid.uuid4().int % 2**32)
             genes[self.mask * self.fixed_mask] = np.random.binomial(1, pruning_probability, np.sum(self.mask * self.fixed_mask))
+            print('GENES:')
+            print(genes[self.mask * self.fixed_mask])
 
             if self.avoid_repeated_individuals and genes.tolist() in df['genes'].apply(list).tolist():
                 if counter < self.population_size:
+                    print('REPEATED GENES FOUND')
+                    print(genes[self.mask * self.fixed_mask])
                     counter += 1
                     continue
                 else: # Too many attempts
@@ -401,7 +422,7 @@ class GeneticPruner:
             evaluation = self.evaluate_genes(genes)
             df.loc[len(df)] = evaluation
         
-        # Return the generation 0
+        # Return Generation 0
         return df
 
     def evaluate_genes(self, genes, dataset = "train"):
@@ -561,7 +582,7 @@ class GeneticTrainer:
         tokenized_dataset = tokenized_dataset.remove_columns(["sentence", "idx"])
         tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
         tokenized_dataset.set_format("torch")
-        train_data = tokenized_dataset["train"].shuffle(seed=42).select(range(400))
+        train_data = tokenized_dataset["train"].shuffle(seed=42).select(range(100))
         eval_data = tokenized_dataset["validation"]#.shuffle(seed=42).select(range(100))
         data_collator = DataCollatorWithPadding(tokenizer)
         self.train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=data_collator)
@@ -652,7 +673,7 @@ class GeneticTrainer:
         print('Initial model evaluation:')
         print(evaluation)
         self.best_metric = evaluation[self.metric]
-        self.best_model = self.model
+        self.best_model = copy.deepcopy(self.model)
 
         # Start training
         self.progress_bar = tqdm(range(self.num_training_steps))
@@ -673,30 +694,16 @@ def main():
     model = load_model()
     genetic_pruner = GeneticPruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data())
     genetic_pruner.fit(model)
-    genetic_pruner.initialize(population_size=10, weight=1)
-    genetic_pruner.train(num_epochs=4)
-    
-    for layer_name in genetic_pruner.layer_names[-1:]:
-        genetic_pruner.evolve(
-            population_size=20,
-            mutation_rate=0.1,
-            n_generations=2,
-            select_n_best=10,
-            elitism_rate=2,
-            weight=1/2,
-            masking=layer_name
-        )
+    genetic_pruner.initialize(population_size=50, weight=4)
 
-    genetic_pruner.train(num_epochs=3)
-
-    for layer_name in genetic_pruner.layer_names[:12]:
+    for layer_name in genetic_pruner.layer_names[::-1]:
         genetic_pruner.evolve(
-            population_size=20,
+            population_size=10,
             mutation_rate=0.1,
-            n_generations=4,
-            select_n_best=10,
+            n_generations=1,
+            select_n_best=20,
             elitism_rate=2,
-            weight=1,
+            weight=4,
             masking=layer_name
         )
 
@@ -704,16 +711,28 @@ def main():
 
     for layer_name in genetic_pruner.layer_names[::-1]:
         genetic_pruner.evolve(
-            population_size=50,
+            population_size=10,
             mutation_rate=0.1,
-            n_generations=4,
-            select_n_best=15,
+            n_generations=1,
+            select_n_best=20,
             elitism_rate=2,
-            weight=1,
+            weight=3,
+            masking=layer_name
+        )
+
+    for layer_name in genetic_pruner.layer_names:
+        genetic_pruner.evolve(
+            population_size=10,
+            mutation_rate=0.1,
+            n_generations=1,
+            select_n_best=20,
+            elitism_rate=2,
+            weight=3,
             masking=layer_name
         )
 
     genetic_pruner.train(num_epochs=4)
+
 
 if __name__ == "__main__":
     main()
