@@ -14,6 +14,7 @@ import torch
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
+import sys
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -458,8 +459,6 @@ class Pruner:
         self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
         self.dump_parameter_configuration(path = trainer.training_path + "/configuration.json")
 
-
-
 class BlockTrainer:
     def __init__(self, num_epochs, metric = 'matthews_correlation'):
         self.num_epochs = num_epochs
@@ -602,60 +601,75 @@ class BlockTrainer:
 
 def main():
     model = load_model()
-    pruner = Pruner(block_size=256, metric='eval_custom', tokenized_dataset=load_tokenized_data(), fix_trained_blocks = False)
+    pruner = Pruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data(), fix_trained_blocks = False)
     pruner.fit(model)
-    pruner.initialize(population_size=30, weight=4)
 
-    pruner.train(num_epochs=4, threshold=0.7)
+    # Declare hyperparameters
+    population_size = None
+    weight = None
+    num_epochs = None
+    threshold = None
 
-    for layer_name in pruner.layer_names:
-        pruner.evolve(
-            population_size=20,
-            weight=3,
-            masking=layer_name
-        )
+    # Example: instructions = 'ps10,w5,ne4,t0.5,I,T,R,F,B'
+    instructions = sys.argv[1]
+    instructions = instructions.split(',')
 
-    for layer_name in pruner.layer_names[::-1]:
-        pruner.evolve(
-            population_size=20,
-            weight=6,
-            masking=layer_name
-        )
+    print('Received instructions:', instructions)
+    for x in instructions:
 
-    pruner.train(num_epochs=4, threshold=0.7)
+        # Set population_size
+        if x.startswith('ps'):
+            population_size = int(x[2:])
 
-    for layer_name in pruner.layer_names:
-        pruner.evolve(
-            population_size=20,
-            weight=3,
-            masking=layer_name
-        )
+        # Set weight
+        elif x.startswith('w'):
+            weight = float(x[1:])
 
-    for layer_name in pruner.layer_names[::-1]:
-        pruner.evolve(
-            population_size=20,
-            weight=6,
-            masking=layer_name
-        )
+        # Set num_epochs
+        elif x.startswith('ne'):
+            num_epochs = int(x[2:])
 
-    pruner.train(num_epochs=4, threshold=0.7)
+        # Set threhold
+        elif x.startswith('t'):
+            threshold = float(x[1:])
 
-    for layer_name in pruner.layer_names:
-        pruner.evolve(
-            population_size=20,
-            weight=3,
-            masking=layer_name
-        )
+        # Initialize pruning
+        elif x == 'I':
+            pruner.initialize(population_size, weight)
         
-    for layer_name in pruner.layer_names[::-1]:
-        pruner.evolve(
-            population_size=20,
-            weight=6,
-            masking=layer_name
-        )
+        # Train
+        elif x == 'T':
+            pruner.train(num_epochs, threshold)
 
-    pruner.train(num_epochs=4, threshold=0.7)
+        # Prune layerwise while iterating forwards
+        elif x == 'F':
+            for layer_name in pruner.layer_names:
+                pruner.evolve(
+                    population_size,
+                    weight,
+                    masking=layer_name
+                )
 
+        # Prune layerwise while iterating backwards
+        elif x == 'B':
+            for layer_name in pruner.layer_names[::-1]:
+                pruner.evolve(
+                    population_size,
+                    weight,
+                    masking=layer_name
+                )
+        
+        # Prune layerwise while iterating randomly
+        elif x == 'R':
+            layers = pruner.layer_names.copy(deep=True)
+            np.random.seed(uuid.uuid4().int % 2**32)
+            np.random.shuffle(layers)
+            for layer_name in layers:
+                pruner.evolve(
+                    population_size,
+                    weight,
+                    masking=layer_name
+                )
 
 if __name__ == "__main__":
     main()
