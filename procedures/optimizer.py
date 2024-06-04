@@ -102,7 +102,8 @@ class Pruner:
         if print_initial_evalutaion:
             print("Evaluation of non-pruned model:")
             trainer = load_trainer(model)
-            evaluation_train = trainer.evaluate(self.tokenized_dataset["train"])
+            # TODO CHANGE THIS AGAIN
+            evaluation_train = trainer.evaluate(self.tokenized_dataset["validation"])
             evaluation_validation = trainer.evaluate(self.tokenized_dataset["validation"])
             print("Train set:")
             print_json(evaluation_train)
@@ -135,6 +136,15 @@ class Pruner:
         self.mask = np.ones(self.total_n_blocks).astype(bool)
         self.fixed_mask = np.ones(self.total_n_blocks).astype(bool)
 
+        # Create attempt folder and add non-pruned evaluation
+        self.create_attempt_folder()
+        self.create_layer_folder(name = 'non-pruned')
+        self.best_individual = self.evaluate_genes(np.zeros(self.total_n_blocks))
+        self.best_individual_validation = self.evaluate_genes(np.zeros(self.total_n_blocks), dataset="validation")
+
+        # Dump class
+        self.dump_parameter_configuration(path = self.layer_path + "/configuration.json")
+
     def create_attempt_folder(self):
         # If output_path does not exist, create it
         if not os.path.exists(self.output_path):
@@ -147,21 +157,23 @@ class Pruner:
         self.attempt_path = self.output_path + f"/attempt_{self.attempt}"
         os.mkdir(self.attempt_path)
 
-    def create_layer_folder(self):
-        print(f"\nOptimizing layer: {self.layer_name}")
+    def create_layer_folder(self, name = None):
+        if name is None:
+            name = self.layer_name
+            print(f"\nOptimizing layer: {name}")
         
         # See how many folders there are in the current attempt and create a new one
         folder_idxs = [int(x.split("_")[0]) for x in os.listdir(self.attempt_path) if x.__contains__('_')]
         n = max(folder_idxs) + 1 if folder_idxs else 0
-        self.layer_path = (self.attempt_path + f"/{n}_{self.layer_name}")
+        self.layer_path = (self.attempt_path + f"/{n}_{name}")
         os.mkdir(self.layer_path)
     
     def initialize(self, population_size, weight, best=None):
         self.population_size = population_size
         self.weight = weight
 
-        # Create a new attempt
-        self.create_attempt_folder()
+        # Create a new layer folder
+        self.create_layer_folder(name = 'initialization')
         
         print("Creating initial population...")
         df = pd.DataFrame(columns=self.columns)
@@ -180,32 +192,38 @@ class Pruner:
         best_idxs = df[self.metric].argsort().tolist()[-20:]
         print(df.loc[best_idxs, self.log_metrics])
         df.to_csv(
-            self.attempt_path + "/initialize.csv",
+            self.layer_path + f"/dataset.csv",
             mode="a",
             header=True,
             index=False,
         )
+
+        # Dump class
+        self.dump_parameter_configuration(path = self.layer_path + "/configuration.json")
 
     def evolve(self, population_size, weight, masking):
         self.population_size = population_size
         self.weight = weight
         self.set_mask(masking)
 
-        # We must reajust eval_custom accordingly in case self.weight has changed
+        # Evaluate best genes just in case some hyperparameters (like weight) have changed
         self.best_individual = self.evaluate_genes(self.best_individual['genes'])
         self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
 
-        # Create a new folder dedicated to the pruning of the specific layer
+        # Create a new folder dedicated to the pruning of the specific layer 
         self.create_layer_folder()
+
+        # Prune the model ONLY at the given masking
+        # For example, prune layer 'distilbert.transformer.layer.5.attention.k_lin.weight'
         self.evolve_()
 
-        # Evaluate on train and validation
+        # Evaluate on train and validation and save configuration
         self.evaluate_best()
-
-        # Save configuration of this evolve step in a .json
         self.dump_parameter_configuration(path = self.layer_path + "/configuration.json")
 
     def evolve_(self):
+        # If self.mask * self.fixed_mask is zero, nothing can be done
+        # This issue typically occurs when a layer is set to zero, all blocks are fixed, and we try to prune the layer
         if np.all(self.mask * self.fixed_mask == 0):
             print("Masking is zero. Nothing to do here.")
             return
@@ -227,6 +245,80 @@ class Pruner:
         self.best_individual = self.get_best(df)
         self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
 
+    def randomly_populate(self):
+        # Start with a new dataset, only containing the best individual found so far
+        df = pd.DataFrame(columns=self.columns)
+        df.loc[len(df)] = self.best_individual
+
+        counter = 0
+        iteration = 0
+        # Create a population by randomly pruning the selected layer
+        while len(df) <= self.population_size:
+            genes = np.array(self.best_individual["genes"]).copy()
+
+            # Create individuals with different pruning probabilities
+            # That is, we will have individuals with different densities of ones
+            # Be sure to include a chromosome full of ZEROS and a chromosome full of ONES
+            if iteration == 0:
+                pruning_probability = 0
+            elif iteration == 1:
+                pruning_probability = 1
+            else:
+                np.random.seed(uuid.uuid4().int % 2**32)
+                pruning_probability = np.random.uniform(0, 1)
+
+            iteration += 1
+
+            # Create random genes
+            np.random.seed(uuid.uuid4().int % 2**32)
+            genes[self.mask * self.fixed_mask] = np.random.binomial(1, pruning_probability, np.sum(self.mask * self.fixed_mask))
+
+            # If we already had found these genes, try again, unless we have tried too many times
+            if self.avoid_repeated_individuals and genes.tolist() in df['genes'].apply(list).tolist():
+                if counter < self.population_size:
+                    counter += 1
+                    continue
+                else: # Too many attempts
+                    print(f'Attention: randomly populating with {len(df)} individuals instead of {self.population_size}')
+                    break
+
+            # Prepare genes to create an individual
+            evaluation = self.evaluate_genes(genes)
+            df.loc[len(df)] = evaluation
+        
+        # Return Generation 0
+        return df
+    
+    def evaluate_genes(self, genes, dataset = "train"):
+        # Do not modify the model in the class
+        model = copy.deepcopy(self.model)
+        trainer = load_trainer(model)
+
+        # Prune the model given the genes
+        n_blocks_per_layer = self.prune_model_by_genes(model, genes)
+        evaluation = trainer.evaluate(self.tokenized_dataset[dataset])
+        evaluation["pruned_area"] = np.sum(n_blocks_per_layer) / self.total_n_blocks
+
+        # Add geometric mean
+        evaluation["eval_gm"] = self.gm(
+            evaluation["pruned_area"],
+            evaluation["eval_matthews"]
+        )
+
+        # Add custom metric
+        evaluation["eval_custom"] = self.custom(
+            evaluation["pruned_area"],
+            evaluation["eval_matthews"]
+        )
+
+        # Add other metrics
+        evaluation["n_blocks"] = n_blocks_per_layer
+        evaluation["pruned_area_layerwise"] = np.array(n_blocks_per_layer) / np.array(self.blocks_per_layer)
+        evaluation["pruned_area_layerwise"] = list(evaluation["pruned_area_layerwise"])
+        evaluation["genes"] = list(genes)
+
+        return evaluation
+    
     def evaluate_best(self):
         # Print BEST INDIVIDUAL
         print(f"Best individual so far evaluated on TRAIN:")
@@ -299,84 +391,16 @@ class Pruner:
         with open(path, "w") as file:
             json.dump(copy_dict, file, indent=4, cls=NpEncoder)
 
-    def randomly_populate(self):
-        # Start with a new dataset, only containing the best individual found so far
-        df = pd.DataFrame(columns=self.columns)
-        df.loc[len(df)] = self.best_individual
-
-        counter = 0
-        iteration = 0
-        # Create a population by randomly pruning the selected layer
-        while len(df) <= self.population_size:
-            genes = np.array(self.best_individual["genes"]).copy()
-
-            # Create individuals with different pruning probabilities
-            # That is, we will have individuals with different densities of ones
-            # Be sure to include a chromosome full of ZEROS and a chromosome full of ONES
-            if iteration == 0:
-                pruning_probability = 0
-            elif iteration == 1:
-                pruning_probability = 1
-            else:
-                np.random.seed(uuid.uuid4().int % 2**32)
-                pruning_probability = np.random.uniform(0, 1)
-
-            iteration += 1
-
-            np.random.seed(uuid.uuid4().int % 2**32)
-            genes[self.mask * self.fixed_mask] = np.random.binomial(1, pruning_probability, np.sum(self.mask * self.fixed_mask))
-
-            if self.avoid_repeated_individuals and genes.tolist() in df['genes'].apply(list).tolist():
-                if counter < self.population_size:
-                    counter += 1
-                    continue
-                else: # Too many attempts
-                    print(f'Attention: randomly populating with {len(df)} individuals instead of {self.population_size}')
-                    break
-
-            evaluation = self.evaluate_genes(genes)
-            df.loc[len(df)] = evaluation
-        
-        # Return Generation 0
-        return df
-
-    def evaluate_genes(self, genes, dataset = "train"):
-        # Do not modify the model in the class
-        model = copy.deepcopy(self.model)
-        trainer = load_trainer(model)
-
-        # Prune the model given the genes
-        n_blocks_per_layer = self.prune_model_by_genes(model, genes)
-        evaluation = trainer.evaluate(self.tokenized_dataset[dataset])
-        evaluation["pruned_area"] = np.sum(n_blocks_per_layer) / self.total_n_blocks
-
-        # Add geometric mean
-        evaluation["eval_gm"] = self.gm(
-            evaluation["pruned_area"],
-            evaluation["eval_matthews"]
-        )
-
-        # Add custom metric
-        evaluation["eval_custom"] = self.custom(
-            evaluation["pruned_area"],
-            evaluation["eval_matthews"]
-        )
-        evaluation["n_blocks"] = n_blocks_per_layer
-        evaluation["pruned_area_layerwise"] = np.array(n_blocks_per_layer) / np.array(self.blocks_per_layer)
-        evaluation["pruned_area_layerwise"] = list(evaluation["pruned_area_layerwise"])
-        evaluation["genes"] = list(genes)
-
-        return evaluation
-
     def prune_model_by_genes(self, model, genes):
         if not isinstance(genes, np.ndarray):
             genes = np.array(genes)
         
         gene_count = 0
         n_blocks_per_layer = []
+        # Iterate over the layers to be pruned
         for layer_name, (x, y) in zip(self.layer_names, self.grid_shapes):
             idxs = np.where(genes[gene_count : gene_count + x * y] == 1)[0]
-            n_blocks_per_layer.append(len(idxs))
+            n_blocks_per_layer.append(len(idxs)) # Keep record of how many blocks there are in each layer
             for idx in idxs:
                 # Block position within the grid
                 i = idx // y
@@ -388,7 +412,7 @@ class Pruner:
                 c = self.block_size * j
                 d = self.block_size * (j + 1)
 
-                # Replace pruned block by previous weights
+                # Replace layer portion by zeros
                 model.state_dict()[layer_name][a:b, c:d].fill_(0)
             gene_count += x * y
 
@@ -415,7 +439,11 @@ class Pruner:
     
     def create_frankenstein(self, new_model):
         genes = self.best_individual['genes']
+        if not isinstance(genes, np.ndarray):
+            genes = np.array(genes)
+
         gene_count = 0
+        # Iterate over the layers to be frankensteined
         for layer_name, (x, y) in zip(self.layer_names, self.grid_shapes):
             idxs = np.where(genes[gene_count : gene_count + x * y] == 1)[0]
             for idx in idxs:
@@ -430,8 +458,22 @@ class Pruner:
                 d = self.block_size * (j + 1)
 
                 # Replace pruned block by previous weights
-                new_model.state_dict()[layer_name][a:b, c:d] = self.model[a:b, c:d]
+                new_model.state_dict()[layer_name][a:b, c:d] = self.model.state_dict()[layer_name][a:b, c:d]
+
             gene_count += x * y
+
+        # IMPORTANT
+        # There should not be any block left in this new model
+        # We print the current zero ratio
+        zeros = 0
+        elements = 0
+        for layer_name in self.layer_names:
+            matrix = new_model.state_dict()[layer_name].cpu().detach().numpy()
+            zeros += np.sum(matrix == 0)
+            elements += matrix.shape[0] * matrix.shape[1]
+
+        print('Ratio of zero elements found:')
+        print(zeros / elements)
 
     def train(self, num_epochs = 3, threshold = 1):
         print('Training...')
@@ -451,9 +493,9 @@ class Pruner:
             self.model = trainer.best_model
             self.fixed_mask = (1 - np.array(self.best_individual['genes'])).astype(bool)
         else:
-            self.create_frankenstein(new_model = trainer.best_model)
+            self.create_frankenstein(trainer.best_model)
             self.model = trainer.best_model
-
+ 
         # Evaluate again best genes
         self.best_individual = self.evaluate_genes(self.best_individual['genes'])
         self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
@@ -498,7 +540,7 @@ class BlockTrainer:
         tokenized_dataset = tokenized_dataset.remove_columns(["sentence", "idx"])
         tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
         tokenized_dataset.set_format("torch")
-        train_data = tokenized_dataset["train"]#.shuffle(seed=42).select(range(100))
+        train_data = tokenized_dataset["train"].shuffle(seed=42).select(range(10))
         eval_data = tokenized_dataset["validation"]#.shuffle(seed=42).select(range(100))
         data_collator = DataCollatorWithPadding(tokenizer)
         self.train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=data_collator)
@@ -611,8 +653,10 @@ def main():
     threshold = None
 
     # Example: instructions = 'ps10,w5,ne4,t0.5,I,T,R,F,B'
-    instructions = sys.argv[1]
-    instructions = instructions.split(',')
+    if len(sys.argv) >= 2:
+        instructions = sys.argv[1].split(',')
+    else:
+        instructions = 'ps5,w5,ne2,t0.5,I,T'.split(',')
 
     print('Received instructions:', instructions)
     for x in instructions:
@@ -661,7 +705,7 @@ def main():
         
         # Prune layerwise while iterating randomly
         elif x == 'R':
-            layers = pruner.layer_names.copy(deep=True)
+            layers = pruner.layer_names.copy()
             np.random.seed(uuid.uuid4().int % 2**32)
             np.random.shuffle(layers)
             for layer_name in layers:
