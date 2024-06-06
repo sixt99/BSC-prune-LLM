@@ -45,7 +45,7 @@ class Pruner:
         block_size,
         metric,
         tokenized_dataset,
-        output_path="procedures/genetic_outputs",
+        output_path="/gpfs/projects/bsc03/bsc03268/genetic_outputs",
         avoid_repeated_individuals = True,
         fix_trained_blocks = True,
     ):
@@ -90,7 +90,7 @@ class Pruner:
         self.blocks_per_layer = None
         self.total_n_blocks = None
         self.population_size = None
-        self.weight = None
+        self.weight = 1
         self.layer_name = None
         self.layer_path = None
 
@@ -102,8 +102,7 @@ class Pruner:
         if print_initial_evalutaion:
             print("Evaluation of non-pruned model:")
             trainer = load_trainer(model)
-            # TODO CHANGE THIS AGAIN
-            evaluation_train = trainer.evaluate(self.tokenized_dataset["validation"])
+            evaluation_train = trainer.evaluate(self.tokenized_dataset["train"])
             evaluation_validation = trainer.evaluate(self.tokenized_dataset["validation"])
             print("Train set:")
             print_json(evaluation_train)
@@ -150,9 +149,20 @@ class Pruner:
         if not os.path.exists(self.output_path):
             os.mkdir(self.output_path)
 
+        # If we receive a number, set attempt to this number
+        self.attempt is None
+        if len(sys.argv) >= 2:
+            for x in sys.argv[1:]:
+                if x.isnumeric():
+                    self.attempt = int(x)
+                    break
+
+        # No number was found
         # See how many attempts there are in the current output folder and create a new one
-        folder_idxs = [int(x.split("_")[1]) for x in os.listdir(self.output_path) if x.__contains__('_')]
-        self.attempt = max(folder_idxs) + 1 if folder_idxs else 0
+        if self.attempt is None:
+            folder_idxs = [int(x.split("_")[1]) for x in os.listdir(self.output_path) if x.__contains__('_')]
+            self.attempt = max(folder_idxs) + 1 if folder_idxs else 0
+        
         print(f"--------- ATTEMPT {self.attempt} ---------")
         self.attempt_path = self.output_path + f"/attempt_{self.attempt}"
         os.mkdir(self.attempt_path)
@@ -428,11 +438,14 @@ class Pruner:
             return 2 / (1 / pruned_area + 1 / matthews)
         
     def custom(self, pruned_area, matthews):
+        '''
         if pruned_area == 0 or matthews <= 0:
             return 0
         else:
             # Numerator rescales metric so that its values go from 0 to 1
             return (1 + self.weight) / (1 / pruned_area + self.weight / matthews)
+        '''
+        return (pruned_area + self.weight * matthews)/(1 + self.weight)
         
     def get_best(self, df):
         return df.loc[df[self.metric].argmax()].to_dict()
@@ -540,8 +553,11 @@ class BlockTrainer:
         tokenized_dataset = tokenized_dataset.remove_columns(["sentence", "idx"])
         tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
         tokenized_dataset.set_format("torch")
-        train_data = tokenized_dataset["train"].shuffle(seed=42).select(range(10))
-        eval_data = tokenized_dataset["validation"]#.shuffle(seed=42).select(range(100))
+
+        train_data = tokenized_dataset["train"]
+        train_data = train_data.shuffle(seed=uuid.uuid4().int % 2**32).select(range(int(0.7 * len(train_data))))
+        eval_data = tokenized_dataset["validation"]
+
         data_collator = DataCollatorWithPadding(tokenizer)
         self.train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=data_collator)
         self.eval_dataloader = DataLoader(eval_data, batch_size=8, collate_fn=data_collator)
@@ -550,7 +566,7 @@ class BlockTrainer:
         self.metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
         self.metrics = {}
         for name in self.metric_names:
-           self.metrics[name] = load_metric(f'./metrics/{name}', experiment_id = int(time.time()))
+           self.metrics[name] = load_metric(f'./metrics/{name}', experiment_id = uuid.uuid4().int % 2**32)
 
         # Device
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
@@ -642,25 +658,38 @@ class BlockTrainer:
 
 
 def main():
-    model = load_model()
-    pruner = Pruner(block_size=128, metric='eval_custom', tokenized_dataset=load_tokenized_data(), fix_trained_blocks = False)
-    pruner.fit(model)
-
     # Declare hyperparameters
+    block_size = None
     population_size = None
     weight = None
     num_epochs = None
     threshold = None
 
-    # Example: instructions = 'ps10,w5,ne4,t0.5,I,T,R,F,B'
+    # Example: instructions = 'bs128,ps10,w5,ne4,t0.5,I,T,R,F,B'
+    instructions = None
     if len(sys.argv) >= 2:
-        instructions = sys.argv[1].split(',')
-    else:
-        instructions = 'ps5,w5,ne2,t0.5,I,T'.split(',')
+        for x in sys.argv[1:]:
+            if not x.isnumeric():
+                instructions = x.split(',')
+                break
+
+    # No instructions were found
+    if instructions is None:
+        instructions = 'bs128,ps15,w5,ne4,t0.5,R,R,R,R,R,R,R,R,T'.split(',')
 
     print('Received instructions:', instructions)
-    for x in instructions:
 
+    for x in instructions:
+        # Set block_size
+        if x.startswith('bs'):
+            block_size = int(x[2:])
+            break
+
+    model = load_model()
+    pruner = Pruner(block_size, metric='eval_custom', tokenized_dataset=load_tokenized_data(), fix_trained_blocks = False)
+    pruner.fit(model)
+
+    for x in instructions:
         # Set population_size
         if x.startswith('ps'):
             population_size = int(x[2:])
