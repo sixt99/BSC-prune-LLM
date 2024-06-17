@@ -1,23 +1,88 @@
 import pandas as pd
 import os
-from utils import *
 import copy
 import uuid
+import numpy as np
 import json
 import warnings
 from transformers import (
     DataCollatorWithPadding,
     get_scheduler
 )
-from datasets import load_metric
+from datasets import load_metric, load_from_disk
 import torch
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 import sys
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer
+)
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+def load_model(model_path):
+    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    return model
 
+def load_trainer(model):
+    training_args = TrainingArguments(
+        per_device_eval_batch_size=100,
+        output_dir="./results"
+    )
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        compute_metrics=compute_metrics
+    )
+    return trainer
+
+def load_tokenizer(tokenizer_path):
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    return tokenizer
+
+def load_tokenized_data(tokenizer, dataset_path, task_name):
+    dataset = load_from_disk(dataset_path)
+
+    def preprocess_function(examples):
+        if 'cola' in task_name.lower():
+            return tokenizer(examples["sentence"], truncation=True, padding=True)
+        elif 'mrpc' in task_name.lower():
+            return tokenizer(examples["sentence1"], examples["sentence2"], truncation=True, padding=True)
+
+    tokenized_dataset = dataset.map(preprocess_function, batched=True)
+    return tokenized_dataset
+
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = np.argmax(pred.predictions, axis=1)
+    tp = np.sum(np.logical_and(preds, labels))
+    tn = np.sum(np.logical_and(preds == 0, labels == 0))
+    fp = np.sum(np.logical_and(preds, labels == 0))
+    fn = np.sum(np.logical_and(preds == 0, labels))
+    acc = np.sum(labels == preds) / len(labels)
+    precision = 0 if tp + fp == 0 else tp / (tp + fp)
+    recall = 0 if tp + fn == 0 else tp / (tp + fn)
+    f1 = 0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
+    mcc = 0 if (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn) == 0 else (tp * tn - fp * fn) / np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    return {
+        "accuracy": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "matthews": mcc,
+    }
+
+def get_metric_name(metric):
+    metric_names = {
+        "eval_accuracy": 'accuracy',
+        "eval_precision": 'precision',
+        "eval_recall": 'recall',
+        "eval_f1": 'f1',
+        "eval_matthews": 'matthews_correlation'
+    }
+    return metric_names[metric]
 
 def get(dict, keys):
     return {key : dict[key] for key in keys if key in dict}
@@ -25,7 +90,7 @@ def get(dict, keys):
 def print_json(dict, indent=4):
     json_evaluation = json.dumps(dict, indent=indent)
     print(json_evaluation)
-
+    
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.int64):
@@ -42,25 +107,26 @@ class NpEncoder(json.JSONEncoder):
 class Pruner:
     def __init__(
         self,
-        block_size,
-        metric,
-        tokenized_dataset,
-        output_path="/gpfs/projects/bsc03/bsc03268/genetic_outputs",
+        output_path="/gpfs/scratch/bsc03/bsc03268/genetic_outputs",
         avoid_repeated_individuals = True,
-        fix_trained_blocks = True,
     ):
-        self.block_size = block_size
-        self.metric = metric
-        self.tokenized_dataset = tokenized_dataset
+        self.block_size = None
+        self.metric = None
+        self.optimization_metric = 'eval_custom'
+        self.task_path = None
+        self.task_name = None
+        self.model = None
+        self.tokenizer = None
+        self.tokenized_dataset = None
         self.output_path = output_path
         self.avoid_repeated_individuals = avoid_repeated_individuals
         self.attempt_path = None
         self.attempt = None
+        self.instructions = None
         self.mask = None
         self.fixed_mask = None
         self.best_individual = None
         self.best_individual_validation = None
-        self.fix_trained_blocks = fix_trained_blocks
         self.columns = [
             "eval_loss",
             "eval_accuracy",
@@ -78,13 +144,7 @@ class Pruner:
             "pruned_area_layerwise",
             "genes",
         ]
-        self.log_metrics = [
-            "pruned_area",
-            "eval_matthews",
-            "eval_gm",
-            "eval_custom"
-        ]
-        self.model = None
+        self.log_metrics = None
         self.layer_names = None
         self.grid_shapes = None
         self.blocks_per_layer = None
@@ -94,26 +154,50 @@ class Pruner:
         self.layer_name = None
         self.layer_path = None
 
-    def fit(self, model, print_initial_evalutaion = False):
-        # Set the starting non-pruned model
-        self.model = model
+    def load_task_resources(self, task_path):
+        self.task_path = task_path
+        self.task_name = os.path.basename(task_path)
+    
+        # Define the paths for the model, tokenizer, and dataset
+        model_path = os.path.join(self.task_path, 'model')
+        tokenizer_path = os.path.join(self.task_path, 'tokenizer')
+        dataset_path = os.path.join(self.task_path, 'dataset')
 
-        # Evaluate the starting model on both train and validation datasets
-        if print_initial_evalutaion:
-            print("Evaluation of non-pruned model:")
-            trainer = load_trainer(model)
-            evaluation_train = trainer.evaluate(self.tokenized_dataset["train"])
-            evaluation_validation = trainer.evaluate(self.tokenized_dataset["validation"])
-            print("Train set:")
-            print_json(evaluation_train)
-            print("Validation set:")
-            print_json(evaluation_validation)
+        # Load the model, tokenizer, and tokenized dataset
+        self.model = load_model(model_path)
+        self.tokenizer = load_tokenizer(tokenizer_path)
+        self.tokenized_dataset = load_tokenized_data(self.tokenizer, dataset_path, self.task_name)
+
+        # Specific preprocessing for different tasks
+        if 'cola' in self.task_name.lower():
+            self.tokenized_dataset = self.tokenized_dataset.remove_columns(["sentence", "idx"])
+            self.tokenized_dataset = self.tokenized_dataset.rename_column("label", "labels")
+            self.tokenized_dataset.set_format("torch")
+
+        elif 'mrpc' in self.task_name.lower():
+            self.tokenized_dataset = self.tokenized_dataset.remove_columns(["sentence1", "sentence2", "idx"])
+            self.tokenized_dataset = self.tokenized_dataset.rename_column("label", "labels")    
+            self.tokenized_dataset.set_format("torch")
+
+    def fit(self, block_size, metric = 'eval_accuracy'):
+        self.block_size = block_size
+        self.metric = metric
+        self.log_metrics = [self.metric] + [
+            "pruned_area",
+            "eval_gm",
+            "eval_custom"
+        ]
 
         # Define the target weight matrices to be pruned
-        # By default, we prune those matrices whose name contains ".layer."
+        # By default, we prune those matrices whose name contains ".layer.", ".layers." or ".albert_layers."
         self.layer_names = []
-        for layer_name in model.state_dict().keys():
-            if len(model.state_dict()[layer_name].shape) == 2 and ".layer." in layer_name:
+        for layer_name in self.model.state_dict().keys():
+            if len(self.model.state_dict()[layer_name].shape) == 2 and (
+                ".layer." in layer_name or
+                ".layers." in layer_name or
+                ".albert_layers." in layer_name or
+                ".h." in layer_name
+            ):
                 self.layer_names.append(layer_name)
         
         # Find the grid structure in our pruning
@@ -121,7 +205,7 @@ class Pruner:
         # [(12, 12), (12, 12), (12, 12), (12, 12), (48, 12), (12, 48), ..., (12, 12), (48, 12), (12, 48)]
         self.grid_shapes = []
         for layer_name in self.layer_names:
-            shape = tuple(np.array(model.state_dict()[layer_name].shape) // self.block_size)
+            shape = tuple(np.array(self.model.state_dict()[layer_name].shape) // self.block_size)
             self.grid_shapes.append(shape)
 
         # Multiply each of the aforementioned tuples to get the list of n. of blocks per grid
@@ -199,7 +283,7 @@ class Pruner:
         self.best_individual = self.get_best(df)
         self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
 
-        best_idxs = df[self.metric].argsort().tolist()[-20:]
+        best_idxs = df[self.optimization_metric].argsort().tolist()[-20:]
         print(df.loc[best_idxs, self.log_metrics])
         df.to_csv(
             self.layer_path + f"/dataset.csv",
@@ -248,7 +332,7 @@ class Pruner:
         )
 
         # Select best indiviuals
-        best_idxs = np.argsort(df[self.metric].tolist())[-20:]
+        best_idxs = np.argsort(df[self.optimization_metric].tolist())[-20:]
         print(df.loc[best_idxs, self.log_metrics])
 
         # After finishing all the generations, take the best individual found
@@ -312,13 +396,13 @@ class Pruner:
         # Add geometric mean
         evaluation["eval_gm"] = self.gm(
             evaluation["pruned_area"],
-            evaluation["eval_matthews"]
+            evaluation[self.metric]
         )
 
         # Add custom metric
         evaluation["eval_custom"] = self.custom(
             evaluation["pruned_area"],
-            evaluation["eval_matthews"]
+            evaluation[self.metric]
         )
 
         # Add other metrics
@@ -388,6 +472,7 @@ class Pruner:
         # Create a copy of the current class and dump it to a .json file
         # This file will inform us of the current parameter configuration for each layer-iteration
         copy_dict = copy.deepcopy(self.__dict__)
+        copy_dict.pop("tokenizer")
         copy_dict.pop("tokenized_dataset")
         copy_dict.pop('model')
         copy_dict["best_individual"]['n_blocks'] = str(copy_dict["best_individual"]['n_blocks']).replace(' ','')
@@ -431,24 +516,24 @@ class Pruner:
     def string2genes(self, string):
         return list(map(int, string[1:-1].split(", ")))
 
-    def gm(self, pruned_area, matthews):
-        if pruned_area == 0 or matthews <= 0:
+    def gm(self, pruned_area, score):
+        if pruned_area == 0 or score <= 0:
             return 0
         else:
-            return 2 / (1 / pruned_area + 1 / matthews)
+            return 2 / (1 / pruned_area + 1 / score)
         
-    def custom(self, pruned_area, matthews):
+    def custom(self, pruned_area, score):
         '''
-        if pruned_area == 0 or matthews <= 0:
+        if pruned_area == 0 or score <= 0:
             return 0
         else:
             # Numerator rescales metric so that its values go from 0 to 1
-            return (1 + self.weight) / (1 / pruned_area + self.weight / matthews)
+            return (1 + self.weight) / (1 / pruned_area + self.weight / score)
         '''
-        return (pruned_area + self.weight * matthews)/(1 + self.weight)
+        return (pruned_area + self.weight * score)/(1 + self.weight)
         
     def get_best(self, df):
-        return df.loc[df[self.metric].argmax()].to_dict()
+        return df.loc[df[self.optimization_metric].argmax()].to_dict()
     
     def create_frankenstein(self, new_model):
         genes = self.best_individual['genes']
@@ -497,42 +582,49 @@ class Pruner:
         self.prune_model_by_genes(copy_model, genes)
 
         # Train
-        trainer = BlockTrainer(num_epochs)
-        trainer.fit(copy_model, self.attempt_path)
+        trainer = BlockTrainer(num_epochs, self.layer_names)
+        trainer.fit(copy_model, self.tokenizer, self.tokenized_dataset, self.attempt_path)
         path = trainer.train(threshold)
 
         # Take best model
-        if self.fix_trained_blocks:
-            self.model = trainer.best_model
-            self.fixed_mask = (1 - np.array(self.best_individual['genes'])).astype(bool)
-        else:
-            self.create_frankenstein(trainer.best_model)
-            self.model = trainer.best_model
+        self.create_frankenstein(trainer.best_model)
+        self.model = trainer.best_model
  
         # Evaluate again best genes
         self.best_individual = self.evaluate_genes(self.best_individual['genes'])
         self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
         self.dump_parameter_configuration(path = trainer.training_path + "/configuration.json")
 
+
 class BlockTrainer:
-    def __init__(self, num_epochs, metric = 'matthews_correlation'):
+    '''
+    metric has to be chosen among the following:
+     * accuracy
+     * precision
+     * recall
+     * f1
+     * matthews_correlation
+    '''
+    
+    def __init__(self, num_epochs, layer_names, metric = 'accuracy'):
         self.num_epochs = num_epochs
         self.model = None
         self.attempt_path = None
         self.training_path = None
+        self.layer_names = layer_names
         self.optimizer = None
         self.train_dataloader = None
         self.eval_dataloader = None
-        self.metric_names = None
+        self.metric = metric
+        self.metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
         self.metrics = None
         self.device = None
         self.lr_scheduler = None
         self.progress_bar = None
         self.best_model = None
         self.num_training_steps = None
-        self.metric = metric
 
-    def fit(self, model, attempt_path):
+    def fit(self, model, tokenizer, tokenized_dataset, attempt_path):
         self.model = model
         load_trainer(model)
         self.attempt_path = attempt_path
@@ -548,12 +640,6 @@ class BlockTrainer:
         self.training_path = self.attempt_path + f'/{n}_training'
 
         # Load self.train_dataloader and self.eval_dataloader
-        tokenizer = load_tokenizer()
-        tokenized_dataset = load_tokenized_data(tokenizer)
-        tokenized_dataset = tokenized_dataset.remove_columns(["sentence", "idx"])
-        tokenized_dataset = tokenized_dataset.rename_column("label", "labels")
-        tokenized_dataset.set_format("torch")
-
         train_data = tokenized_dataset["train"]
         train_data = train_data.shuffle(seed=uuid.uuid4().int % 2**32).select(range(int(0.7 * len(train_data))))
         eval_data = tokenized_dataset["validation"]
@@ -563,7 +649,6 @@ class BlockTrainer:
         self.eval_dataloader = DataLoader(eval_data, batch_size=8, collate_fn=data_collator)
 
         # Metrics
-        self.metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
         self.metrics = {}
         for name in self.metric_names:
            self.metrics[name] = load_metric(f'./metrics/{name}', experiment_id = uuid.uuid4().int % 2**32)
@@ -625,15 +710,16 @@ class BlockTrainer:
         if self.best_model is not None:
             self.best_model.save_pretrained(self.training_path)
 
-    def train(self, threshold = 1, save_model = True):
+    def train(self, threshold = 1, save_model = False):
         # Freeze those layers whose pruning ratio is higher or equal than threshold
         # In other words, train only least pruned layers
         # TODO MIRAR MÉS AVIAT LA MÀSCARA, NO ELS ELEMENTS QUE SIGUIN ZERO
         if 0 <= threshold < 1:
-            for param in self.model.distilbert.parameters():
-                tensor = param.cpu().detach().numpy()
-                if len(tensor.shape) == 2 and np.sum(tensor == 0) / (tensor.shape[0] * tensor.shape[1]) >= threshold:
-                    param.requires_grad = False
+            for name, param in self.model.named_parameters():
+                if name in self.layer_names:
+                    tensor = param.cpu().detach().numpy()
+                    if len(tensor.shape) == 2 and np.sum(tensor == 0) / (tensor.shape[0] * tensor.shape[1]) >= threshold:
+                        param.requires_grad = False
 
         # Initial evaluation
         evaluation = self.evaluate()
@@ -642,7 +728,7 @@ class BlockTrainer:
         self.best_metric = evaluation[self.metric]
         self.best_model = copy.deepcopy(self.model)
 
-        # Start training
+        # Train and keep track of the best model on validation
         self.progress_bar = tqdm(range(self.num_training_steps))
         for _ in range(self.num_epochs):
             self.train_step()
@@ -658,14 +744,18 @@ class BlockTrainer:
 
 
 def main():
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
     # Declare hyperparameters
+    task_name = None
     block_size = None
     population_size = None
     weight = None
     num_epochs = None
     threshold = None
 
-    # Example: instructions = 'bs128,ps10,w5,ne4,t0.5,I,T,R,F,B'
+    # Get instructions
     instructions = None
     if len(sys.argv) >= 2:
         for x in sys.argv[1:]:
@@ -675,36 +765,69 @@ def main():
 
     # No instructions were found
     if instructions is None:
-        instructions = 'bs128,ps15,w5,ne4,t0.5,R,R,R,R,R,R,R,R,T'.split(',')
+        instructions = 'textattack.roberta-base-CoLA,ps5,ne2,w1,bs64,t0.1,F,T'.split(',')
 
     print('Received instructions:', instructions)
 
-    for x in instructions:
-        # Set block_size
-        if x.startswith('bs'):
-            block_size = int(x[2:])
-            break
+    # ----- Set task -----
+    # Possible task_names:
+    # 09panesara.distilbert-base-uncased-finetuned-cola
+    # Intel.bert-base-uncased-mrpc
+    # textattack.roberta-base-CoLA
+    # tanganke.gpt2_cola
+    # tanganke.gpt2_mrpc
 
-    model = load_model()
-    pruner = Pruner(block_size, metric='eval_custom', tokenized_dataset=load_tokenized_data(), fix_trained_blocks = False)
-    pruner.fit(model)
+    task_name = instructions[0]
+    task_path = os.path.join('/gpfs/scratch/bsc03/bsc03268/tasks', task_name)
+
+    # ----- Set block size -----
+    # Tested block_sizes so far:
+    # * 64
+    # * 128
+    # * 256
+
+    for x in instructions:
+        if x.startswith('bs'):
+            try:
+                block_size = int(x[2:])
+                break
+            except ValueError:
+                pass
+
+    # Create instance of pruner
+    pruner = Pruner()
+    pruner.instructions = instructions
+    pruner.load_task_resources(task_path)
+    pruner.fit(block_size, metric='eval_accuracy')
 
     for x in instructions:
         # Set population_size
         if x.startswith('ps'):
-            population_size = int(x[2:])
-
+            try:
+                population_size = int(x[2:])
+            except ValueError:
+                pass
+        
         # Set weight
         elif x.startswith('w'):
-            weight = float(x[1:])
+            try:
+                weight = float(x[1:])
+            except ValueError:
+                pass
 
         # Set num_epochs
         elif x.startswith('ne'):
-            num_epochs = int(x[2:])
+            try:
+                num_epochs = int(x[2:])
+            except ValueError:
+                pass
 
         # Set threhold
         elif x.startswith('t'):
-            threshold = float(x[1:])
+            try:
+                threshold = float(x[1:])
+            except ValueError:
+                pass
 
         # Initialize pruning
         elif x == 'I':
