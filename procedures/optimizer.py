@@ -7,72 +7,18 @@ import json
 import warnings
 from transformers import (
     DataCollatorWithPadding,
+    DataCollatorForSeq2Seq,
     get_scheduler
 )
-from datasets import load_metric, load_from_disk
 import torch
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 import sys
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    TrainingArguments,
-    Trainer
-)
-
-def load_model(model_path):
-    model = AutoModelForSequenceClassification.from_pretrained(model_path)
-    return model
-
-def load_trainer(model):
-    training_args = TrainingArguments(
-        per_device_eval_batch_size=100,
-        output_dir="./results"
-    )
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        compute_metrics=compute_metrics
-    )
-    return trainer
-
-def load_tokenizer(tokenizer_path):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    return tokenizer
-
-def load_tokenized_data(tokenizer, dataset_path, task_name):
-    dataset = load_from_disk(dataset_path)
-
-    def preprocess_function(examples):
-        if 'cola' in task_name.lower():
-            return tokenizer(examples["sentence"], truncation=True, padding=True)
-        elif 'mrpc' in task_name.lower():
-            return tokenizer(examples["sentence1"], examples["sentence2"], truncation=True, padding=True)
-
-    tokenized_dataset = dataset.map(preprocess_function, batched=True)
-    return tokenized_dataset
-
-def compute_metrics(pred):
-    labels = pred.label_ids
-    preds = np.argmax(pred.predictions, axis=1)
-    tp = np.sum(np.logical_and(preds, labels))
-    tn = np.sum(np.logical_and(preds == 0, labels == 0))
-    fp = np.sum(np.logical_and(preds, labels == 0))
-    fn = np.sum(np.logical_and(preds == 0, labels))
-    acc = np.sum(labels == preds) / len(labels)
-    precision = 0 if tp + fp == 0 else tp / (tp + fp)
-    recall = 0 if tp + fn == 0 else tp / (tp + fn)
-    f1 = 0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
-    mcc = 0 if (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn) == 0 else (tp * tn - fp * fn) / np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
-    return {
-        "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "matthews": mcc,
-    }
+import evaluate
+from datasets import load_metric
+import basic_functions
+from accelerate import Accelerator
 
 def get_metric_name(metric):
     metric_names = {
@@ -104,10 +50,34 @@ class NpEncoder(json.JSONEncoder):
         return super(NpEncoder, self).default(obj)
 
 
+# Get instructions
+instructions = None
+if len(sys.argv) >= 2:
+    for x in sys.argv[1:]:
+        if not x.isnumeric():
+            instructions = x.split(',')
+            break
+
+task_name = instructions[0]
+if 'cola' in task_name.lower() or 'mrpc' in task_name.lower():
+    get_columns = basic_functions.get_columns_classification
+    load_training_args = basic_functions.load_training_args_classification
+    load_trainer = basic_functions.load_trainer_classification
+    load_model = basic_functions.load_model_classification
+    load_tokenizer = basic_functions.load_tokenizer_classification
+    load_tokenized_data = basic_functions.load_tokenized_data_classification
+elif 'opus' in task_name.lower():
+    get_columns = basic_functions.get_columns_translation
+    load_training_args = basic_functions.load_training_args_translation
+    load_trainer = basic_functions.load_trainer_translation
+    load_model = basic_functions.load_model_translation
+    load_tokenizer = basic_functions.load_tokenizer_translation
+    load_tokenized_data = basic_functions.load_tokenized_data_translation
+
 class Pruner:
     def __init__(
         self,
-        output_path="/gpfs/scratch/bsc03/bsc03268/genetic_outputs",
+        output_path="/gpfs/projects/bsc03/bsc03268/genetic_outputs",
         avoid_repeated_individuals = True,
     ):
         self.block_size = None
@@ -118,6 +88,8 @@ class Pruner:
         self.model = None
         self.tokenizer = None
         self.tokenized_dataset = None
+        self.training_args = None
+        self.data_collator = None
         self.output_path = output_path
         self.avoid_repeated_individuals = avoid_repeated_individuals
         self.attempt_path = None
@@ -127,23 +99,7 @@ class Pruner:
         self.fixed_mask = None
         self.best_individual = None
         self.best_individual_validation = None
-        self.columns = [
-            "eval_loss",
-            "eval_accuracy",
-            "eval_precision",
-            "eval_recall",
-            "eval_f1",
-            "eval_matthews",
-            "eval_gm",
-            "eval_custom",
-            "eval_runtime",
-            "eval_samples_per_second",
-            "eval_steps_per_second",
-            "pruned_area",
-            "n_blocks",
-            "pruned_area_layerwise",
-            "genes",
-        ]
+        self.columns = None
         self.log_metrics = None
         self.layer_names = None
         self.grid_shapes = None
@@ -168,35 +124,42 @@ class Pruner:
         self.tokenizer = load_tokenizer(tokenizer_path)
         self.tokenized_dataset = load_tokenized_data(self.tokenizer, dataset_path, self.task_name)
 
-        # Specific preprocessing for different tasks
-        if 'cola' in self.task_name.lower():
-            self.tokenized_dataset = self.tokenized_dataset.remove_columns(["sentence", "idx"])
-            self.tokenized_dataset = self.tokenized_dataset.rename_column("label", "labels")
-            self.tokenized_dataset.set_format("torch")
-
-        elif 'mrpc' in self.task_name.lower():
-            self.tokenized_dataset = self.tokenized_dataset.remove_columns(["sentence1", "sentence2", "idx"])
-            self.tokenized_dataset = self.tokenized_dataset.rename_column("label", "labels")    
-            self.tokenized_dataset.set_format("torch")
-
     def fit(self, block_size, metric = 'eval_accuracy'):
         self.block_size = block_size
         self.metric = metric
+        self.columns = get_columns() + [
+            "eval_custom",
+            "eval_runtime",
+            "eval_samples_per_second",
+            "eval_steps_per_second",
+            "pruned_area",
+            "n_blocks",
+            "pruned_area_layerwise",
+            "genes"
+        ]
         self.log_metrics = [self.metric] + [
             "pruned_area",
-            "eval_gm",
             "eval_custom"
         ]
+
+        self.training_args = load_training_args()
+        self.data_collator = DataCollatorForSeq2Seq(self.tokenizer, self.model)
 
         # Define the target weight matrices to be pruned
         # By default, we prune those matrices whose name contains ".layer.", ".layers." or ".albert_layers."
         self.layer_names = []
         for layer_name in self.model.state_dict().keys():
-            if len(self.model.state_dict()[layer_name].shape) == 2 and (
-                ".layer." in layer_name or
-                ".layers." in layer_name or
-                ".albert_layers." in layer_name or
-                ".h." in layer_name
+            dimensions = self.model.state_dict()[layer_name].shape
+            if (
+                len(dimensions) == 2 and
+                dimensions[0] >= self.block_size and
+                dimensions[1] >= self.block_size and
+                (
+                    ".layer." in layer_name or
+                    ".layers." in layer_name or
+                    ".albert_layers." in layer_name or
+                    ".h." in layer_name
+                )
             ):
                 self.layer_names.append(layer_name)
         
@@ -386,11 +349,20 @@ class Pruner:
     def evaluate_genes(self, genes, dataset = "train"):
         # Do not modify the model in the class
         model = copy.deepcopy(self.model)
-        trainer = load_trainer(model)
+
+        # Parallelize using several GPUs
+        accelerator = Accelerator()
+        model, self.tokenizer, self.data_collator = accelerator.prepare(
+            model, self.tokenizer, self.data_collator
+        )
+
+        trainer = load_trainer(model, self.tokenizer, self.training_args, self.data_collator)
 
         # Prune the model given the genes
         n_blocks_per_layer = self.prune_model_by_genes(model, genes)
-        evaluation = trainer.evaluate(self.tokenized_dataset[dataset])
+        # TODO
+        selected_data = self.tokenized_dataset[dataset].shuffle(seed=uuid.uuid4().int % 2**32).select(range(300))
+        evaluation = trainer.evaluate(selected_data)
         evaluation["pruned_area"] = np.sum(n_blocks_per_layer) / self.total_n_blocks
 
         # Add geometric mean
@@ -475,6 +447,8 @@ class Pruner:
         copy_dict.pop("tokenizer")
         copy_dict.pop("tokenized_dataset")
         copy_dict.pop('model')
+        copy_dict.pop('training_args')
+        copy_dict.pop('data_collator')
         copy_dict["best_individual"]['n_blocks'] = str(copy_dict["best_individual"]['n_blocks']).replace(' ','')
         copy_dict["best_individual"]['genes'] = str(copy_dict["best_individual"]['genes']).replace(' ','')
         copy_dict["best_individual_validation"]['n_blocks'] = str(copy_dict["best_individual_validation"]['n_blocks']).replace(' ','')
@@ -562,7 +536,7 @@ class Pruner:
 
         # IMPORTANT
         # There should not be any block left in this new model
-        # We print the current zero ratio
+        # We print the current zero ratio to be sure
         zeros = 0
         elements = 0
         for layer_name in self.layer_names:
@@ -584,7 +558,7 @@ class Pruner:
         # Train
         trainer = BlockTrainer(num_epochs, self.layer_names)
         trainer.fit(copy_model, self.tokenizer, self.tokenized_dataset, self.attempt_path)
-        path = trainer.train(threshold)
+        trainer.train(threshold)
 
         # Take best model
         self.create_frankenstein(trainer.best_model)
@@ -616,7 +590,7 @@ class BlockTrainer:
         self.train_dataloader = None
         self.eval_dataloader = None
         self.metric = metric
-        self.metric_names = ['accuracy', 'precision', 'recall', 'f1', 'matthews_correlation']
+        self.metric_names = ['accuracy', 'precision', 'f1', 'matthews_correlation']
         self.metrics = None
         self.device = None
         self.lr_scheduler = None
@@ -626,7 +600,7 @@ class BlockTrainer:
 
     def fit(self, model, tokenizer, tokenized_dataset, attempt_path):
         self.model = model
-        load_trainer(model)
+        load_trainer(model, tokenizer, self.training_args)
         self.attempt_path = attempt_path
         self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
 
@@ -638,10 +612,13 @@ class BlockTrainer:
         folder_idxs = [int(x.split("_")[0]) for x in os.listdir(self.attempt_path) if x.__contains__('_')]
         n = max(folder_idxs) + 1 if folder_idxs else 0
         self.training_path = self.attempt_path + f'/{n}_training'
+        os.mkdir(self.training_path)
 
         # Load self.train_dataloader and self.eval_dataloader
         train_data = tokenized_dataset["train"]
-        train_data = train_data.shuffle(seed=uuid.uuid4().int % 2**32).select(range(int(0.7 * len(train_data))))
+        # TODO
+        train_data = train_data.shuffle(seed=uuid.uuid4().int % 2**32).select(range(100))
+        # train_data = train_data.shuffle(seed=uuid.uuid4().int % 2**32).select(range(int(0.7 * len(train_data))))
         eval_data = tokenized_dataset["validation"]
 
         data_collator = DataCollatorWithPadding(tokenizer)
@@ -662,7 +639,7 @@ class BlockTrainer:
             name="linear", optimizer=self.optimizer, num_warmup_steps=0, num_training_steps=self.num_training_steps
         )
 
-    def evaluate(self):
+    def evaluate_model(self):
         self.model.eval() # Set the model to evaluation mode
         for batch in self.eval_dataloader:
             # Move the batch data to the specified device (CPU, MPS or GPU)
@@ -722,7 +699,7 @@ class BlockTrainer:
                         param.requires_grad = False
 
         # Initial evaluation
-        evaluation = self.evaluate()
+        evaluation = self.evaluate_model()
         print('Initial model evaluation:')
         print_json(evaluation)
         self.best_metric = evaluation[self.metric]
@@ -732,7 +709,7 @@ class BlockTrainer:
         self.progress_bar = tqdm(range(self.num_training_steps))
         for _ in range(self.num_epochs):
             self.train_step()
-            evaluation = self.evaluate()
+            evaluation = self.evaluate_model()
             print_json(evaluation)
             if self.best_metric < evaluation[self.metric]:
                 self.best_metric = evaluation[self.metric]
@@ -746,6 +723,7 @@ class BlockTrainer:
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=UserWarning)
 
     # Declare hyperparameters
     task_name = None
@@ -754,18 +732,6 @@ def main():
     weight = None
     num_epochs = None
     threshold = None
-
-    # Get instructions
-    instructions = None
-    if len(sys.argv) >= 2:
-        for x in sys.argv[1:]:
-            if not x.isnumeric():
-                instructions = x.split(',')
-                break
-
-    # No instructions were found
-    if instructions is None:
-        instructions = 'textattack.roberta-base-CoLA,ps5,ne2,w1,bs64,t0.1,F,T'.split(',')
 
     print('Received instructions:', instructions)
 
@@ -778,7 +744,8 @@ def main():
     # tanganke.gpt2_mrpc
 
     task_name = instructions[0]
-    task_path = os.path.join('/gpfs/scratch/bsc03/bsc03268/tasks', task_name)
+    task_path = os.path.join('/gpfs/projects/bsc03/bsc03268/tasks', task_name)
+    metric = instructions[1]
 
     # ----- Set block size -----
     # Tested block_sizes so far:
@@ -798,7 +765,7 @@ def main():
     pruner = Pruner()
     pruner.instructions = instructions
     pruner.load_task_resources(task_path)
-    pruner.fit(block_size, metric='eval_accuracy')
+    pruner.fit(block_size, metric=metric)
 
     for x in instructions:
         # Set population_size
