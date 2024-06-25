@@ -16,7 +16,6 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 import sys
 import evaluate
-from datasets import load_metric
 import basic_functions
 from accelerate import Accelerator
 
@@ -360,9 +359,27 @@ class Pruner:
 
         # Prune the model given the genes
         n_blocks_per_layer = self.prune_model_by_genes(model, genes)
-        # TODO
-        selected_data = self.tokenized_dataset[dataset].shuffle(seed=uuid.uuid4().int % 2**32).select(range(300))
-        evaluation = trainer.evaluate(selected_data)
+        evaluation = trainer.evaluate(self.tokenized_dataset[dataset])
+
+        # TODO can we migrate to native torch?
+
+        # model.eval()
+        # for step, batch in enumerate(eval_dataloader):
+        #     # We could avoid this line since we set the accelerator with `device_placement=True`.
+        #     batch.to(accelerator.device)
+        #     with torch.no_grad():
+        #         outputs = model(**batch)
+        #     predictions = outputs.logits.argmax(dim=-1)
+        #     predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
+        #     for name in metric_names:
+        #         metrics[name].add_batch(
+        #             predictions=predictions,
+        #             references=references,
+        #         )
+        # evaluation = {}
+        # for name in metric_names:
+        #     evaluation.update(metrics[name].compute())
+
         evaluation["pruned_area"] = np.sum(n_blocks_per_layer) / self.total_n_blocks
 
         # Add geometric mean
@@ -600,7 +617,7 @@ class BlockTrainer:
 
     def fit(self, model, tokenizer, tokenized_dataset, attempt_path):
         self.model = model
-        load_trainer(model, tokenizer, self.training_args)
+        load_trainer(model, tokenizer)#, self.training_args)
         self.attempt_path = attempt_path
         self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
 
@@ -616,9 +633,7 @@ class BlockTrainer:
 
         # Load self.train_dataloader and self.eval_dataloader
         train_data = tokenized_dataset["train"]
-        # TODO
-        train_data = train_data.shuffle(seed=uuid.uuid4().int % 2**32).select(range(100))
-        # train_data = train_data.shuffle(seed=uuid.uuid4().int % 2**32).select(range(int(0.7 * len(train_data))))
+        train_data = train_data
         eval_data = tokenized_dataset["validation"]
 
         data_collator = DataCollatorWithPadding(tokenizer)
@@ -628,7 +643,7 @@ class BlockTrainer:
         # Metrics
         self.metrics = {}
         for name in self.metric_names:
-           self.metrics[name] = load_metric(f'./metrics/{name}', experiment_id = uuid.uuid4().int % 2**32)
+           self.metrics[name] = evaluate.load(f'./metrics/{name}', experiment_id = uuid.uuid4().int % 2**32)
 
         # Device
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
