@@ -593,8 +593,19 @@ class Pruner:
         self.prune_model_by_genes(copy_model, genes)
 
         # Train
-        block_trainer = BlockTrainer(num_epochs, self.layer_names)
-        block_trainer.fit(copy_model, self.tokenizer, self.tokenized_datasets, self.attempt_path)
+        block_trainer = BlockTrainer(
+            num_epochs = num_epochs,
+            model = copy_model,
+            attempt_path = self.attempt_path,
+            layer_names = self.layer_names,
+            train_dataloader = self.train_dataloader,
+            eval_dataloader = self.eval_dataloader,
+            metric_name = self.metric_name,
+            metric_names = self.metric_names,
+            metric_instances = self.metric_instances,
+            device = self.device
+        )
+        block_trainer.initialize()
         block_trainer.train(threshold)
 
         # Take best model
@@ -608,38 +619,39 @@ class Pruner:
 
 
 class BlockTrainer:
-    '''
-    metric has to be chosen among the following:
-     * accuracy
-     * precision
-     * recall
-     * f1
-     * matthews_correlation
-    '''
-    
-    def __init__(self, num_epochs, layer_names, metric = 'accuracy'):
+    def __init__(self,
+            num_epochs,
+            model,
+            attempt_path,
+            layer_names,
+            train_dataloader,
+            eval_dataloader,
+            metric_name,
+            metric_names,
+            metric_instances,
+            device):
+        
+        # Attributes initialized by Pruner
         self.num_epochs = num_epochs
-        self.model = None
-        self.attempt_path = None
-        self.training_path = None
-        self.layer_names = layer_names
-        self.optimizer = None
-        self.train_dataloader = None
-        self.eval_dataloader = None
-        self.metric = metric
-        self.metric_names = ['accuracy', 'precision', 'f1', 'matthews_correlation']
-        self.metrics = None
-        self.device = None
-        self.lr_scheduler = None
-        self.progress_bar = None
-        self.best_model = None
-        self.num_training_steps = None
-
-    def fit(self, model, tokenizer, tokenized_datasets, attempt_path):
         self.model = model
         self.attempt_path = attempt_path
-        self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
+        self.layer_names = layer_names
+        self.train_dataloader = train_dataloader
+        self.eval_dataloader = eval_dataloader
+        self.metric_name = metric_name
+        self.metric_names = metric_names
+        self.metric_instances = metric_instances
+        self.device = device
 
+        # Non-initialized attributes
+        training_path = None,
+        optimizer = None,
+        lr_scheduler = None,
+        progress_bar = None,
+        best_model = None,
+        num_training_steps = None
+
+    def initialize(self):
         # Create attempt path in case it does not exist
         if not os.path.exists(self.attempt_path):
             os.mkdir(self.attempt_path)
@@ -650,21 +662,8 @@ class BlockTrainer:
         self.training_path = self.attempt_path + f'/{n}_training'
         os.mkdir(self.training_path)
 
-        # Load self.train_dataloader and self.eval_dataloader
-        train_data = tokenized_datasets["train"]
-        eval_data = tokenized_datasets["validation"]
-
-        data_collator = DataCollatorWithPadding(tokenizer)
-        self.train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=data_collator)
-        self.eval_dataloader = DataLoader(eval_data, batch_size=8, collate_fn=data_collator)
-
-        # Metrics
-        self.metrics = {}
-        for name in self.metric_names:
-           self.metrics[name] = evaluate.load(f'./metrics/{name}', experiment_id = uuid.uuid4().int % 2**32)
-
-        # Device
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
+        # Optimizer
+        self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
 
         # Scheduler
         self.num_training_steps = self.num_epochs * len(self.train_dataloader)
@@ -673,7 +672,6 @@ class BlockTrainer:
         )
 
     def evaluate_model(self):
-        print('Evaluating model...', flush=True)
         self.model.eval() # Set the model to evaluation mode
         for batch in self.eval_dataloader:
             # Move the batch data to the specified device (CPU, MPS or GPU)
@@ -689,11 +687,11 @@ class BlockTrainer:
             
             # Update each metric with the current batch of predictions and references (true labels)
             for name in self.metric_names:
-                self.metrics[name].add_batch(predictions=predictions, references=batch["labels"])
+                self.metric_instances[name].add_batch(predictions=predictions, references=batch["labels"])
 
         evaluation = {}
         for name in self.metric_names:
-            evaluation.update(self.metrics[name].compute())
+            evaluation.update(self.metric_instances[name].compute())
 
         return evaluation
 
@@ -735,8 +733,8 @@ class BlockTrainer:
         # Initial evaluation
         evaluation = self.evaluate_model()
         print('Initial model evaluation:', flush=True)
-        print_json(evaluation, flush=True)
-        self.best_metric = evaluation[self.metric]
+        print_json(evaluation)
+        self.best_metric = evaluation[self.metric_name]
         self.best_model = copy.deepcopy(self.model)
 
         # Train and keep track of the best model on validation
@@ -744,15 +742,14 @@ class BlockTrainer:
         for _ in range(self.num_epochs):
             self.train_step()
             evaluation = self.evaluate_model()
-            print_json(evaluation, flush=True)
-            if self.best_metric < evaluation[self.metric]:
-                self.best_metric = evaluation[self.metric]
+            print_json(evaluation)
+            if self.best_metric < evaluation[self.metric_name]:
+                self.best_metric = evaluation[self.metric_name]
                 self.best_model = copy.deepcopy(self.model)
 
         # After finishing, save BEST model
         if save_model:
             self.save_best()
-
 
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
