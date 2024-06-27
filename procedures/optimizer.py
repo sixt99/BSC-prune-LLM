@@ -55,6 +55,8 @@ if 'cola' in task_name.lower() or 'mrpc' in task_name.lower():
     load_tokenized_data = basic_functions.load_tokenized_data_classification
     load_data_collator = basic_functions.load_data_collator_classification
     load_metric_names = basic_functions.load_metric_names_classification
+    evaluate_model = basic_functions.evaluate_model_classification
+    train_step = basic_functions.train_step_classification
 elif 'opus' in task_name.lower():
     get_columns = basic_functions.get_columns_translation
     load_model = basic_functions.load_model_translation
@@ -62,6 +64,8 @@ elif 'opus' in task_name.lower():
     load_tokenized_data = basic_functions.load_tokenized_data_translation
     load_data_collator = basic_functions.load_data_collator_translation
     load_metric_names = basic_functions.load_metric_names_translation
+    evaluate_model = basic_functions.evaluate_model_translation
+    train_step = basic_functions.train_step_translation
 
 class Pruner:
     def __init__(
@@ -103,6 +107,7 @@ class Pruner:
         self.train_dataloader = None
         self.eval_dataloader = None
         self.device = None
+        self.accelerator = Accelerator()
 
     def load_task_resources(self, task_path):
         self.task_path = task_path
@@ -120,13 +125,28 @@ class Pruner:
         self.model = load_model(model_path).to(self.device)
         self.tokenizer = load_tokenizer(tokenizer_path)
         self.tokenized_datasets = load_tokenized_data(self.tokenizer, dataset_path, self.task_name)
-        train_data = self.tokenized_datasets["train"]#.shuffle(seed=42).select(range(1000))
-        eval_data = self.tokenized_datasets["validation"]#.shuffle(seed=42).select(range(1000))
+        # TODO
+        train_data = self.tokenized_datasets["train"].select(range(100))#.shuffle(seed=42).select(range(1000))
+        eval_data = self.tokenized_datasets["validation"].select(range(100))#.shuffle(seed=42).select(range(1000))
 
         # Data_collator and data_loaders
-        self.data_collator = load_data_collator(self.tokenizer, self.model)
-        self.train_dataloader = DataLoader(train_data, shuffle=True, batch_size=8, collate_fn=self.data_collator)
-        self.eval_dataloader = DataLoader(eval_data, batch_size=8, collate_fn=self.data_collator)
+        self.data_collator = load_data_collator(self.tokenizer)
+        self.train_dataloader = DataLoader(
+            train_data,
+            shuffle=True,
+            batch_size=8,
+            collate_fn=self.data_collator
+        )
+        self.eval_dataloader = DataLoader(
+            eval_data,
+            batch_size=8,
+            collate_fn=self.data_collator
+        )
+
+        # Prepare with accelerator
+        self.train_dataloader, self.eval_dataloader, self.data_collator = self.accelerator.prepare(
+            self.train_dataloader, self.eval_dataloader, self.data_collator
+        )
 
     def fit(self, block_size, metric_name = 'accuracy'):
         self.block_size = block_size
@@ -360,45 +380,26 @@ class Pruner:
         
         # Return Generation 0
         return df
-    
-    def evaluate_model(self, model, dataset = "train"):
-        dataloader = self.train_dataloader if dataset == "train" else self.eval_dataloader
-        model.eval() # Set the model to evaluation mode
-        for batch in dataloader:
-            # Move the batch data to the specified device (CPU, MPS or GPU)
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            
-            # Disable gradient calculation for evaluation
-            with torch.no_grad():
-                outputs = model(**batch) # Forward pass: compute model outputs
-            
-            # Compute predicted labels by taking the argmax over the logits
-            logits = outputs.logits
-            predictions = torch.argmax(logits, dim=-1)
-            
-            # Update each metric with the current batch of predictions and references (true labels)
-            for name in self.metric_names:
-                self.metric_instances[name].add_batch(predictions=predictions, references=batch["labels"])
-
-        evaluation = {}
-        for name in self.metric_names:
-            evaluation.update(self.metric_instances[name].compute())
-
-        return evaluation
 
     def evaluate_genes(self, genes, dataset = "train"):
         # Do not modify the model in the class
         model = copy.deepcopy(self.model)
+        model = self.accelerator.prepare(model)
 
-        # Parallelize using several GPUs
-        accelerator = Accelerator()
-        model, self.tokenizer, self.data_collator = accelerator.prepare(
-            model, self.tokenizer, self.data_collator
-        )
+        # Define set to evaluate
+        dataloader = self.train_dataloader if dataset == "train" else self.eval_dataloader
 
         # Prune the model given the genes
         n_blocks_per_layer = self.prune_model_by_genes(model, genes)
-        evaluation = self.evaluate_model(model, dataset)
+        evaluation = evaluate_model(
+            model,
+            dataloader,
+            self.tokenizer,
+            self.device,
+            self.metric_names,
+            self.metric_instances,
+            self.accelerator
+        )
         evaluation["pruned_area"] = np.sum(n_blocks_per_layer) / self.total_n_blocks
 
         # Add geometric mean
@@ -591,6 +592,7 @@ class Pruner:
         copy_model = copy.deepcopy(self.model)
         genes = self.best_individual['genes']
         self.prune_model_by_genes(copy_model, genes)
+        copy_model = self.accelerator.prepare(copy_model) # Prepare with accelerator
 
         # Train
         block_trainer = BlockTrainer(
@@ -603,7 +605,9 @@ class Pruner:
             metric_name = self.metric_name,
             metric_names = self.metric_names,
             metric_instances = self.metric_instances,
-            device = self.device
+            device = self.device,
+            tokenizer = self.tokenizer,
+            accelerator = self.accelerator
         )
         block_trainer.initialize()
         block_trainer.train(threshold)
@@ -611,7 +615,8 @@ class Pruner:
         # Take best model
         self.create_frankenstein(block_trainer.best_model)
         self.model = block_trainer.best_model
- 
+        self.model = self.accelerator.prepare(self.model) # Prepare with accelerator
+
         # Evaluate again best genes
         self.best_individual = self.evaluate_genes(self.best_individual['genes'])
         self.best_individual_validation = self.evaluate_genes(self.best_individual['genes'], dataset="validation")
@@ -620,17 +625,19 @@ class Pruner:
 
 class BlockTrainer:
     def __init__(self,
-            num_epochs,
-            model,
-            attempt_path,
-            layer_names,
-            train_dataloader,
-            eval_dataloader,
-            metric_name,
-            metric_names,
-            metric_instances,
-            device):
-        
+        num_epochs,
+        model,
+        attempt_path,
+        layer_names,
+        train_dataloader,
+        eval_dataloader,
+        metric_name,
+        metric_names,
+        metric_instances,
+        device,
+        tokenizer,
+        accelerator
+    ):
         # Attributes initialized by Pruner
         self.num_epochs = num_epochs
         self.model = model
@@ -642,14 +649,16 @@ class BlockTrainer:
         self.metric_names = metric_names
         self.metric_instances = metric_instances
         self.device = device
+        self.tokenizer = tokenizer
+        self.accelerator = accelerator
 
         # Non-initialized attributes
-        training_path = None,
-        optimizer = None,
-        lr_scheduler = None,
-        progress_bar = None,
-        best_model = None,
-        num_training_steps = None
+        self.training_path = None
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.progress_bar = None
+        self.best_model = None
+        self.num_training_steps = None
 
     def initialize(self):
         # Create attempt path in case it does not exist
@@ -671,49 +680,10 @@ class BlockTrainer:
             name="linear", optimizer=self.optimizer, num_warmup_steps=0, num_training_steps=self.num_training_steps
         )
 
-    def evaluate_model(self):
-        self.model.eval() # Set the model to evaluation mode
-        for batch in self.eval_dataloader:
-            # Move the batch data to the specified device (CPU, MPS or GPU)
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            
-            # Disable gradient calculation for evaluation
-            with torch.no_grad():
-                outputs = self.model(**batch) # Forward pass: compute model outputs
-            
-            # Compute predicted labels by taking the argmax over the logits
-            logits = outputs.logits
-            predictions = torch.argmax(logits, dim=-1)
-            
-            # Update each metric with the current batch of predictions and references (true labels)
-            for name in self.metric_names:
-                self.metric_instances[name].add_batch(predictions=predictions, references=batch["labels"])
-
-        evaluation = {}
-        for name in self.metric_names:
-            evaluation.update(self.metric_instances[name].compute())
-
-        return evaluation
-
-    def train_step(self):
-        self.model.train() # Set the model to training mode
-        for batch in self.train_dataloader:
-            # Move the batch data to the specified device (CPU, MPS, or GPU)
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            
-            outputs = self.model(**batch) # Forward pass: compute model outputs
-            loss = outputs.loss # Extract the loss from the model outputs
-            loss.backward() # Backward pass: compute gradients
-            
-            # Set gradients of blocks to zero
-            for name, param in self.model.named_parameters():
-                if len(param.shape) == 2 and param.requires_grad:  # Check if the parameter is a 2D tensor and requires gradients
-                    param.grad[param.cpu().detach().numpy() == 0] = 0
-
-            self.optimizer.step() # Update model parameters based on gradients
-            self.lr_scheduler.step() # Update learning rate based on the scheduler
-            self.optimizer.zero_grad() # Reset gradients for the next iteration
-            self.progress_bar.update(1) # Update the progress bar
+        # Prepare with accelerator
+        self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+            self.optimizer, self.lr_scheduler
+        )
 
     def save_best(self):
         if self.best_model is not None:
@@ -731,7 +701,14 @@ class BlockTrainer:
                         param.requires_grad = False
 
         # Initial evaluation
-        evaluation = self.evaluate_model()
+        evaluation = evaluate_model(
+            self.model,
+            self.eval_dataloader,
+            self.tokenizer,
+            self.device,
+            self.metric_names,
+            self.metric_instances
+        )
         print('Initial model evaluation:', flush=True)
         print_json(evaluation)
         self.best_metric = evaluation[self.metric_name]
@@ -740,9 +717,28 @@ class BlockTrainer:
         # Train and keep track of the best model on validation
         self.progress_bar = tqdm(range(self.num_training_steps))
         for _ in range(self.num_epochs):
-            self.train_step()
-            evaluation = self.evaluate_model()
+            # Update gradients
+            train_step(
+                self.model,
+                self.train_dataloader,
+                self.device,
+                self.optimizer,
+                self.lr_scheduler,
+                self.progress_bar
+            )
+
+            # See how the model behaves
+            evaluation = evaluate_model(
+                self.model,
+                self.eval_dataloader,
+                self.tokenizer,
+                self.device,
+                self.metric_names,
+                self.metric_instances
+            )
             print_json(evaluation)
+
+            # Take the best model found so far
             if self.best_metric < evaluation[self.metric_name]:
                 self.best_metric = evaluation[self.metric_name]
                 self.best_model = copy.deepcopy(self.model)
@@ -765,14 +761,6 @@ def main():
     threshold = None
 
     print('Received instructions:', instructions, flush=True)
-
-    # ----- Set task -----
-    # Possible task_names:
-    # 09panesara.distilbert-base-uncased-finetuned-cola
-    # Intel.bert-base-uncased-mrpc
-    # textattack.roberta-base-CoLA
-    # tanganke.gpt2_cola
-    # tanganke.gpt2_mrpc
 
     task_name = instructions[0]
     task_path = os.path.join('/gpfs/projects/bsc03/bsc03268/tasks', task_name)
