@@ -4,7 +4,6 @@ import copy
 import uuid
 import numpy as np
 import json
-import warnings
 from transformers import (
     DataCollatorWithPadding,
     DataCollatorForSeq2Seq,
@@ -19,7 +18,26 @@ import evaluate
 import basic_functions
 from accelerate import Accelerator
 import gc
-    
+
+######### DEBUG #########
+# i = accelerator.process_index
+# with open("cuda:" + str(accelerator.process_index), 'a') as file:
+#     t = torch.cuda.get_device_properties(i).total_memory
+#     r = torch.cuda.memory_reserved(i)
+#     a = torch.cuda.memory_allocated(i)
+#     f = r-a  # free inside reserved
+
+#     file.write("t " + str(t / (1024 ** 3)) + "\n")
+#     file.write("r " + str(r / (1024 ** 3)) + "\n")
+#     file.write("a " + str(a / (1024 ** 3)) + "\n")
+#     file.write("f " + str(f / (1024 ** 3)) + "\n\n")
+######### DEBUG #########
+
+debug = False
+
+accelerator = Accelerator()
+seed_index = 0
+
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.int64):
@@ -42,7 +60,7 @@ if len(sys.argv) >= 2:
             break
 
 task_name = instructions[0]
-if 'cola' in task_name.lower() or 'mrpc' in task_name.lower():
+if 'cola' in task_name.lower() or 'mrpc' in task_name.lower() or 'mnli' in task_name.lower():
     get_columns = basic_functions.get_columns_classification
     load_model = basic_functions.load_model_classification
     load_tokenizer = basic_functions.load_tokenizer_classification
@@ -61,8 +79,6 @@ elif 'opus' in task_name.lower():
     evaluate_model = basic_functions.evaluate_model_translation
     train_step = basic_functions.train_step_translation
 
-accelerator = Accelerator()
-
 def get(dict, keys):
     return {key : dict[key] for key in keys if key in dict}
 
@@ -74,6 +90,22 @@ def print_json(dict, indent=4):
 def make_directory(path):
     if not os.path.exists(path):
         os.mkdir(path)
+
+@accelerator.on_main_process
+def create_seeds(path, n_seeds = 10000):
+    if os.path.exists(path):
+        os.remove(path)
+    with open(path, 'a') as file:
+        for _ in range(n_seeds):
+            file.write(str(uuid.uuid4().int % 2**32) + "\n")
+
+def get_seed(path):
+    global seed_index
+    with open(path, "r") as file:
+        seed_list = [line.strip() for line in file.readlines()]
+    seed = int(seed_list[seed_index])
+    seed_index += 1
+    return seed
 
 class Pruner:
 
@@ -113,14 +145,19 @@ class Pruner:
         self.weight = 1
         self.layer_name = None
         self.layer_path = None
-        self.device = None
         self.train_data = None
         self.eval_data = None
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.num_training_steps = None
 
-    def load_some_data(self, amount, dataset = "train"):
+    def load_some_data(self, amount = "all", dataset = "train"):
         if dataset == "train":
+            dt = self.train_data.shuffle(seed = get_seed(self.attempt_path + "/seeds.txt"))
+            if isinstance(amount, int):
+                dt = dt.select(range(amount))
             train_dataloader = DataLoader(
-                self.train_data.shuffle(seed = uuid.uuid4().int % 2**32).select(range(amount)),
+                dt,
                 shuffle=True,
                 batch_size=8,
                 collate_fn=self.data_collator
@@ -131,8 +168,11 @@ class Pruner:
             return train_dataloader
             
         elif dataset == "validation":
+            dt = self.eval_data.shuffle(seed = get_seed(self.attempt_path + "/seeds.txt"))
+            if isinstance(amount, int):
+                dt = dt.select(range(amount))
             eval_dataloader = DataLoader(
-                self.eval_data.shuffle(seed = uuid.uuid4().int % 2**32).select(range(amount)),
+                dt,
                 batch_size=8,
                 collate_fn=self.data_collator
             )
@@ -150,11 +190,9 @@ class Pruner:
         tokenizer_path = os.path.join(self.task_path, 'tokenizer')
         dataset_path = os.path.join(self.task_path, 'dataset')
 
-        # Device
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
-
         # Load the model, tokenizer, and tokenized dataset
-        self.model = load_model(model_path).to(self.device)
+        device = accelerator.device
+        self.model = load_model(model_path).to(device)
         self.tokenizer = load_tokenizer(tokenizer_path)
         self.tokenized_datasets = load_tokenized_data(self.tokenizer, dataset_path, self.task_name)
         self.train_data = self.tokenized_datasets["train"]
@@ -175,10 +213,12 @@ class Pruner:
         self.optimization_metric_name = 'mean' # The metric the algorithm actually optimizes
         self.log_metric_names = [self.metric_name] + [ # The list of metrics to be shown when logging
             "pruned_area",
-            "mean"
+            "mean",
+            "geometric_mean"
         ]
         self.columns = get_columns() + [ # The columns of which to keep record in the datasets
             "mean",
+            "geometric_mean",
             # "eval_runtime",
             # "eval_samples_per_second",
             # "eval_steps_per_second",
@@ -187,6 +227,7 @@ class Pruner:
             "pruned_area_layerwise",
             "genes"
         ]
+
         self.metric_instances = {} # Dictionary (metric_name ---> metric_class)
         for name in self.metric_names:
            self.metric_instances[name] = evaluate.load(f'./metrics/{name}', experiment_id = uuid.uuid4().int % 2**32)
@@ -230,6 +271,7 @@ class Pruner:
 
         # Create attempt folder and add non-pruned evaluation
         self.create_attempt_folder()
+        create_seeds(self.attempt_path + "/seeds.txt")
         self.create_layer_folder(name = 'non-pruned')
         self.best_individual = self.evaluate_genes(np.zeros(self.total_n_blocks))
         self.best_individual_validation = self.evaluate_genes(np.zeros(self.total_n_blocks), dataset="validation")
@@ -263,7 +305,7 @@ class Pruner:
             folder_idxs = [int(x.split("_")[1]) for x in os.listdir(self.output_path) if x.__contains__('_')]
             self.attempt = max(folder_idxs) + 1 if folder_idxs else 0
         
-        accelerator.print(f"--------- ATTEMPT {self.attempt} ---------", flush=True)
+        accelerator.print(f"\n--------- ATTEMPT {self.attempt} ---------", flush=True)
         self.attempt_path = self.output_path + f"/attempt_{self.attempt}"
         make_directory(self.attempt_path)
         accelerator.wait_for_everyone() # Syncronize
@@ -291,7 +333,7 @@ class Pruner:
         accelerator.print("Creating initial population...", flush=True)
         df = pd.DataFrame(columns=self.columns)
         for _ in range(population_size):
-            np.random.seed(uuid.uuid4().int % 2**32)
+            np.random.seed(get_seed(self.attempt_path + "/seeds.txt"))
             # Create individuals with different pruning probabilities
             # That is, we will have individuals with different densities of ones
             pruning_probability = np.random.uniform(0.05, 0.7)
@@ -305,7 +347,7 @@ class Pruner:
         best_idxs = df[self.optimization_metric_name].argsort().tolist()[-20:]
         accelerator.print(df.loc[best_idxs, self.log_metric_names], flush=True)
         df.to_csv(
-            self.layer_path + f"/dataset.csv",
+            self.layer_path + "/dataset.csv",
             mode="a",
             header=True,
             index=False,
@@ -347,7 +389,7 @@ class Pruner:
         df = self.randomly_populate()
         if accelerator.is_main_process:
             df.to_csv(
-                self.layer_path + f"/dataset.csv",
+                self.layer_path + "/dataset.csv",
                 mode="a",
                 header=True,
                 index=False,
@@ -381,18 +423,21 @@ class Pruner:
             elif iteration == 1:
                 pruning_probability = 1
             else:
-                np.random.seed(uuid.uuid4().int % 2**32)
+                np.random.seed(get_seed(self.attempt_path + "/seeds.txt"))
                 pruning_probability = np.random.uniform(0, 1)
 
             iteration += 1
 
             # Create random genes
-            np.random.seed(uuid.uuid4().int % 2**32)
+            np.random.seed(get_seed(self.attempt_path + "/seeds.txt"))
             genes[self.mask * self.fixed_mask] = np.random.binomial(1, pruning_probability, np.sum(self.mask * self.fixed_mask))
 
             # If we already had found these genes, try again, unless we have tried too many times
             if self.avoid_repeated_individuals and genes.tolist() in df['genes'].apply(list).tolist():
                 if counter < self.population_size:
+                    accelerator.print(f'Attention: repeated individual found', flush = True)
+                    accelerator.print(pruning_probability)
+                    accelerator.print(f'Genes: {genes[self.mask * self.fixed_mask].astype(int).tolist()}', flush = True)
                     counter += 1
                     continue
                 else: # Too many attempts
@@ -408,28 +453,26 @@ class Pruner:
 
     def evaluate_genes(self, genes, dataset = "train"):
         copy_model = copy.deepcopy(self.model)
-        copy_model = accelerator.prepare(copy_model) # Prepare using accelerator
+        # TOREMOVE
+        # copy_model = accelerator.prepare(copy_model) # Prepare using accelerator
 
         # Define set to evaluate
-        dataloader = self.load_some_data(amount = 200, dataset = dataset)
+        if debug:
+            dataloader = self.load_some_data(amount = 10, dataset = dataset)
+        else:
+            dataloader = self.load_some_data(amount = 400, dataset = dataset)
+            # dataloader = self.load_some_data(dataset = dataset)
 
-        # Prune the copy model given the genes
+        # Prune the copy model given the genes and see how the model performs
         n_blocks_per_layer = self.prune_model_by_genes(copy_model, genes)
         evaluation = evaluate_model(
             copy_model,
             dataloader,
             self.tokenizer,
-            self.device,
             self.metric_names,
             self.metric_instances,
             accelerator
         )
-        
-        # Free space as soon as we can
-        del copy_model
-        gc.collect()
-        torch.cuda.empty_cache()
-        self.model = self.model.cuda() # Send original model back to GPU
 
         # Add pruned area
         evaluation["pruned_area"] = np.sum(n_blocks_per_layer) / self.total_n_blocks
@@ -520,7 +563,6 @@ class Pruner:
                 'model',
                 'training_args',
                 'data_collator',
-                'device',
                 'metric_instances',
                 'train_data',
                 'eval_data'
@@ -559,8 +601,15 @@ class Pruner:
                 c = self.block_size * j
                 d = self.block_size * (j + 1)
 
+                # In some cases, 'module.' is appended at the beggining of the layer's name
+                real_name = layer_name
+                for _ in range(100):
+                    if real_name in model.state_dict().keys():
+                        break
+                    else:
+                        real_name = 'module.' + real_name
+
                 # Replace layer portion by zeros
-                real_name = layer_name if layer_name in model.state_dict().keys() else 'module.' + layer_name
                 model.state_dict()[real_name][a:b, c:d].fill_(0)
             gene_count += x * y
 
@@ -573,7 +622,7 @@ class Pruner:
         if pruned_area == 0 or score <= 0:
             return 0
         else:
-            return 2 / (1 / pruned_area + 1 / score)
+            return (1 + self.weight) / (1 / pruned_area + self.weight / score)
         
     def mean(self, pruned_area, score):
         return (pruned_area + self.weight * score)/(1 + self.weight)
@@ -601,8 +650,22 @@ class Pruner:
                 c = self.block_size * j
                 d = self.block_size * (j + 1)
 
+                # In some cases, 'module.' is appended at the beggining of the layer's name
+                real_name1 = layer_name
+                for _ in range(100):
+                    if real_name1 in self.model.state_dict().keys():
+                        break
+                    else:
+                        real_name1 = 'module.' + real_name1
+                real_name2 = layer_name
+                for _ in range(100):
+                    if real_name2 in self.model.state_dict().keys():
+                        break
+                    else:
+                        real_name2 = 'module.' + real_name2
+                        
                 # Replace pruned block by previous weights
-                new_model.state_dict()[layer_name][a:b, c:d] = self.model.state_dict()[layer_name][a:b, c:d]
+                new_model.state_dict()[real_name2][a:b, c:d] = self.model.state_dict()[real_name1][a:b, c:d]
 
             gene_count += x * y
 
@@ -612,7 +675,13 @@ class Pruner:
         zeros = 0
         elements = 0
         for layer_name in self.layer_names:
-            matrix = new_model.state_dict()[layer_name].cpu().detach().numpy()
+            real_name = layer_name
+            for _ in range(100):
+                if real_name in new_model.state_dict().keys():
+                    break
+                else:
+                    real_name = 'module.' + real_name
+            matrix = new_model.state_dict()[real_name].cpu().detach().numpy()
             zeros += np.sum(matrix == 0)
             elements += matrix.shape[0] * matrix.shape[1]
 
@@ -623,16 +692,22 @@ class Pruner:
         accelerator.print('Training...', flush=True)
 
         # Prune a copy of the model using the best genes so far
-        self.model = self.model.cpu() # Move self.model to CPU
         copy_model = copy.deepcopy(self.model) # Create a copy
-        copy_model = copy_model.cuda() # Move copy to GPU
         genes = self.best_individual['genes']
         self.prune_model_by_genes(copy_model, genes)
+
+        # Attention: for some reason, 'module.' is appended in the beggining of every layer's name
         copy_model = accelerator.prepare(copy_model) # Prepare with accelerator
 
         # Load data to train and evaluate
-        train_dataloader = self.load_some_data(amount = 700000, dataset = "train")
-        eval_dataloader = self.load_some_data(amount = 1000, dataset = "validation")
+        if debug:
+            train_dataloader = self.load_some_data(amount = 10, dataset = "train")
+            eval_dataloader = self.load_some_data(amount = 10, dataset = "validation")
+        else:
+            train_dataloader = self.load_some_data(amount = 500000, dataset = "train")
+            eval_dataloader = self.load_some_data(amount = 10000, dataset = "validation")
+            # train_dataloader = self.load_some_data(dataset = "train")
+            # eval_dataloader = self.load_some_data(dataset = "validation")
 
         # Train
         block_trainer = BlockTrainer(
@@ -645,23 +720,14 @@ class Pruner:
             metric_name = self.metric_name,
             metric_names = self.metric_names,
             metric_instances = self.metric_instances,
-            device = self.device,
-            tokenizer = self.tokenizer,
+            tokenizer = self.tokenizer
         )
         block_trainer.initialize()
         block_trainer.train(threshold)
 
-        # Free space as soon as we can
-        del copy_model
-        gc.collect()
-        torch.cuda.empty_cache()
-        self.model = self.model.cuda() # Send original model back to GPU
-        self.block_trainer.best_model = self.block_trainer.best_model.cuda() # Send best model to GPU
-
         # Take best model
         self.create_frankenstein(block_trainer.best_model)
         self.model = block_trainer.best_model
-        self.model = accelerator.prepare(self.model) # Prepare with accelerator
 
         # Evaluate again best genes
         self.best_individual = self.evaluate_genes(self.best_individual['genes'])
@@ -669,6 +735,34 @@ class Pruner:
         self.dump_parameter_configuration(path = block_trainer.training_path + "/configuration.json")
         accelerator.wait_for_everyone() # Syncronize
 
+    def evaluate_random_prunings(self, path, n_evaluations = None, limit = 0.6):
+        # Take self.total_n_blocks as default
+        if n_evaluations is None:
+            n_evaluations = self.total_n_blocks
+
+        # Define dataframe
+        df = pd.DataFrame(columns=self.columns)
+        for ratio in [x for x in np.arange(n_evaluations + 1)/n_evaluations if x < limit]:
+            try:
+                # Create genes such that, approximately, n_ones / len(genes) is ratio
+                genes = np.zeros(self.total_n_blocks)
+                idxs = np.random.choice(range(self.total_n_blocks), int(ratio * self.total_n_blocks), replace = False)
+                genes[idxs] = 1
+                evaluation = self.evaluate_genes(genes)
+                accelerator.print(f"Pruned area: {evaluation['pruned_area']} Metric: {evaluation[self.metric_name]}")
+                df.loc[len(df)] = evaluation
+            except:
+                continue
+
+        if accelerator.is_main_process:
+            df.to_csv(
+                path,
+                mode="w",
+                header=True,
+                index=False,
+            )
+
+        accelerator.wait_for_everyone() # Syncronize
 
 class BlockTrainer:
     def __init__(self,
@@ -681,8 +775,7 @@ class BlockTrainer:
         metric_name,
         metric_names,
         metric_instances,
-        device,
-        tokenizer
+        tokenizer,
     ):
         # Attributes initialized by Pruner
         self.num_epochs = num_epochs
@@ -694,41 +787,39 @@ class BlockTrainer:
         self.metric_name = metric_name
         self.metric_names = metric_names
         self.metric_instances = metric_instances
-        self.device = device
         self.tokenizer = tokenizer
 
         # Non-initialized attributes
         self.training_path = None
-        self.optimizer = None
-        self.lr_scheduler = None
         self.progress_bar = None
         self.best_model = None
         self.num_training_steps = None
+        self.optimizer = None
+        self.lr_scheduler = None
 
     def initialize(self):
         # Create attempt path in case it does not exist
         if not os.path.exists(self.attempt_path):
             make_directory(self.attempt_path)
+
+        # Optimizer and scheduler
+        self.num_training_steps = self.num_epochs * len(self.train_dataloader)
+        self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
+        self.lr_scheduler = get_scheduler(
+            name="linear",
+            optimizer=self.optimizer,
+            num_warmup_steps=0,
+            num_training_steps=self.num_training_steps
+        )
+        self.optimizer, self.lr_scheduler = accelerator.prepare(
+            self.optimizer, self.lr_scheduler
+        )
         
         # See how many folders there are in the current attempt and create a new one
         folder_idxs = [int(x.split("_")[0]) for x in os.listdir(self.attempt_path) if x.__contains__('_')]
         n = max(folder_idxs) + 1 if folder_idxs else 0
         self.training_path = self.attempt_path + f'/{n}_training'
         make_directory(self.training_path)
-
-        # Optimizer
-        self.optimizer = AdamW(self.model.parameters(), lr=5e-5)
-
-        # Scheduler
-        self.num_training_steps = self.num_epochs * len(self.train_dataloader)
-        self.lr_scheduler = get_scheduler(
-            name="linear", optimizer=self.optimizer, num_warmup_steps=0, num_training_steps=self.num_training_steps
-        )
-
-        # Prepare with accelerator
-        self.optimizer, self.lr_scheduler = accelerator.prepare(
-            self.optimizer, self.lr_scheduler
-        )
 
     def save_best(self):
         if self.best_model is not None:
@@ -750,7 +841,6 @@ class BlockTrainer:
             self.model,
             self.eval_dataloader,
             self.tokenizer,
-            self.device,
             self.metric_names,
             self.metric_instances,
             accelerator
@@ -767,7 +857,6 @@ class BlockTrainer:
             train_step(
                 self.model,
                 self.train_dataloader,
-                self.device,
                 self.optimizer,
                 self.lr_scheduler,
                 self.progress_bar,
@@ -779,7 +868,6 @@ class BlockTrainer:
                 self.model,
                 self.eval_dataloader,
                 self.tokenizer,
-                self.device,
                 self.metric_names,
                 self.metric_instances,
                 accelerator
@@ -789,9 +877,7 @@ class BlockTrainer:
             # Take the best model found so far
             if self.best_metric < evaluation[self.metric_name]:
                 self.best_metric = evaluation[self.metric_name]
-                self.model = self.model.cpu() # Move to CPU
-                self.best_model = copy.deepcopy(self.model) # Save in CPU
-                self.model = self.model.cuda() # Move back to GPU
+                self.best_model = copy.deepcopy(self.model)
 
         # After finishing, save BEST model
         if save_model:
@@ -831,6 +917,14 @@ def main():
     pruner.instructions = instructions
     pruner.load_task_resources(task_path)
     pruner.fit(block_size, metric_name = metric_name)
+
+    # Evaluate random prunings if required
+    if "ERP" in instructions:
+        pruner.evaluate_random_prunings(
+            path = os.path.join(task_path, f"ERP_{block_size}.csv"),
+            #n_evaluations = 10
+        )
+        return
 
     for x in instructions:
         # Set population_size
@@ -890,9 +984,22 @@ def main():
         # Prune layerwise while iterating randomly
         elif x == 'R':
             layers = pruner.layer_names.copy()
-            np.random.seed(uuid.uuid4().int % 2**32)
+            np.random.seed(get_seed(pruner.attempt_path + "/seeds.txt"))
             np.random.shuffle(layers)
             for layer_name in layers:
+                pruner.evolve(
+                    population_size,
+                    weight,
+                    masking=layer_name
+                )
+
+        # Prune layerwise while iterating N layers randomly
+        elif x.startswith('R') and x[1:].isnumeric():
+            N = int(x[1:])
+            layers = pruner.layer_names.copy()
+            np.random.seed(get_seed(pruner.attempt_path + "/seeds.txt"))
+            np.random.shuffle(layers)
+            for layer_name in layers[:N]:
                 pruner.evolve(
                     population_size,
                     weight,
