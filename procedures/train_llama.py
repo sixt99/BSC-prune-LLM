@@ -1,33 +1,27 @@
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_scheduler
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import DataCollatorForSeq2Seq
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-import numpy as np
+from torch.utils.data import DataLoader
 from datasets import load_from_disk
-import evaluate
 from accelerate import Accelerator
 from tqdm.auto import tqdm
+import numpy as np
+import evaluate
 import torch
-from torch.utils.data import DataLoader
-from transformers import get_scheduler
 import uuid
-from peft import LoraConfig, TaskType, get_peft_model
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, set_seed
 import copy
-import torch.nn.functional as F
 import json 
 import os     
 
-# Useful pages: 
+# Useful pages:
 # https://www.youtube.com/watch?time_continue=3938&v=Pb_RGAl75VE&embeds_referring_euri=https%3A%2F%2Fwww.google.com%2F&source_ve_path=Mjg2NjMsMjg2NjY&feature=emb_logo
 # https://github.com/Maykeye/BTLM-peft-test-4bit/blob/main/test-btlm.ipynb
 # https://github.com/tcapelle/llm_recipes/blob/main/nbs/Alpaca_finetunning_with_WandB.ipynb
 
-show_examples = True
-batch_size = 2
-evaluate_after_each_epoch = True
 seed_index = 0
-
 accelerator = Accelerator()
+torch.set_printoptions(threshold=10000)
+
 
 @accelerator.on_main_process
 def create_seeds(path, n_seeds = 10000):
@@ -37,6 +31,7 @@ def create_seeds(path, n_seeds = 10000):
         for _ in range(n_seeds):
             file.write(str(uuid.uuid4().int % 2**32) + "\n")
 
+
 def get_seed(path):
     global seed_index
     with open(path, "r") as file:
@@ -44,6 +39,7 @@ def get_seed(path):
     seed = int(seed_list[seed_index])
     seed_index += 1
     return seed
+
 
 def prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size = 64):
     if not isinstance(genes, np.ndarray):
@@ -68,7 +64,7 @@ def prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size = 64
 
             # In some cases, 'module.' is appended at the beggining of the layer's name
             real_name = layer_name
-            for _ in range(100):
+            for _ in range(1000):
                 if real_name in model.state_dict().keys():
                     break
                 else:
@@ -81,36 +77,45 @@ def prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size = 64
     return n_blocks_per_layer
 
 
-def get_pruning_info(model, block_size = 256):
+def get_pruning_info(model, block_size=256):
     layer_names = []
     for layer_name in model.state_dict().keys():
         dimensions = model.state_dict()[layer_name].shape
+        # Check if the layer is a 2D matrix (e.g., weight matrix) and both dimensions
+        # are greater than or equal to block_size
         if (
-            len(dimensions) == 2 and
-            dimensions[0] >= block_size and
-            dimensions[1] >= block_size and
+            len(dimensions) == 2 and  # The layer must be a 2D matrix
+            dimensions[0] >= block_size and  # The first dimension must be >= block_size
+            dimensions[1] >= block_size and  # The second dimension must be >= block_size
             (
+                # The layer's name must contain specific substrings indicating that it is
+                # a layer that should be considered for pruning
                 ".layer." in layer_name or
                 ".layers." in layer_name or
                 ".albert_layers." in layer_name or
                 ".h." in layer_name
             )
         ):
+            # If all conditions are met, add the layer name to the list
             layer_names.append(layer_name)
+    
+    # Grid shapes for each layer
     grid_shapes = []
     for layer_name in layer_names:
         shape = tuple(np.array(model.state_dict()[layer_name].shape) // block_size)
         grid_shapes.append(shape)
+    
     blocks_per_layer = [i * j for i, j in grid_shapes]
     total_n_blocks = np.sum(blocks_per_layer).astype(int)
     np.random.seed(get_seed("./seeds.txt"))
+    
+    # Generate a binary array representing which blocks will be pruned (1) and which will not (0)
     genes = np.random.binomial(1, 0.2, total_n_blocks)
-
+    
     return layer_names, grid_shapes, blocks_per_layer, total_n_blocks, genes, block_size
 
 
-
-
+# Count how many zeros there are in the model's weights
 def check_n_zeros(model, layer_names):
     zeros = 0
     elements = 0
@@ -121,14 +126,15 @@ def check_n_zeros(model, layer_names):
     return zeros / elements
 
 
-
-
-
-# Evaluate how the model performs using metric
+# Evaluate how the model performs using metric (generally, either bleu or rouge)
 def evaluate_model(model, tokenizer, dataloader, metric, device):
+    decoded_sentences_list = []
+    decoded_labels_list = []
+
     model.eval()
     for batch in dataloader:
         new = batch['labels'].clone()
+
         # Remove the tokens corresponding to the response
         # Place these tokens at the end of the row, with padding tokens on the left
         new = torch.where(batch['labels'] == -100, batch['input_ids'], 2)
@@ -161,29 +167,37 @@ def evaluate_model(model, tokenizer, dataloader, metric, device):
         labels = accelerator.gather(labels)
 
         # Turn tokens into text and select the response
+        # len(decoded_sentences) is multiplied by N if N is the amount of GPUs used
+        # len(decoded_sentences) = batch_size * N
         decoded_sentences = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         decoded_sentences = [x.split('In this conversation,')[1].strip() for x in decoded_sentences]
         decoded_labels = torch.where(labels == -100, 2, labels)
         decoded_labels = tokenizer.batch_decode(decoded_labels, skip_special_tokens=True)
+        decoded_labels = [x.strip() for x in decoded_labels]
 
-        if show_examples:
-            accelerator.print('---------------------', flush = True)
-            accelerator.print('Decoded sentences:')
-            accelerator.print(json.dumps(decoded_sentences, indent = 4), flush = True)
-            accelerator.print('Decoded labels:')
-            accelerator.print(json.dumps(decoded_labels, indent = 4), flush = True)
+        decoded_sentences_list += decoded_sentences
+        decoded_labels_list += decoded_labels
 
         # Compute metric
         metric.add_batch(predictions=decoded_sentences, references=decoded_labels)
 
+    counter = 0
+    for x, y in zip(decoded_sentences_list, decoded_labels_list):
+        accelerator.print(counter, flush = True)
+        accelerator.print(x, flush = True)
+        accelerator.print(y, flush = True)
+        accelerator.print(flush = True)
+        counter += 1
+
     return metric.compute()
+
 
 def load_some_data(amount, tokenized_datasets, data_collator, dataset = "train"):
     if dataset == "train":
         train_dataloader = DataLoader(
             tokenized_datasets["train"].shuffle(seed = get_seed('./seeds.txt')).select(range(amount)),
             shuffle=True,
-            batch_size=batch_size,
+            batch_size=2,
             collate_fn=data_collator
         )
         return train_dataloader
@@ -196,12 +210,15 @@ def load_some_data(amount, tokenized_datasets, data_collator, dataset = "train")
         )
         return eval_dataloader
 
+
 def main():
     create_seeds('./seeds.txt', n_seeds = 10000)
+    accelerator.print(f'Number of GPUs: {accelerator.num_processes}', flush = True)
     
     # Define special tokens to indicate instructions
     B_INST, E_INST = "[INST]", "[/INST]"
     B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
+
 
     def preprocess_function(examples):
         # Define prompts. Example:
@@ -215,7 +232,7 @@ def main():
         prompts = [instructions + ex + E_INST + "\nIn this conversation, " for ex, sum in zip(examples['dialogue'], examples['summary'])]
         inputs = [prompt + sum + tokenizer.eos_token for prompt, sum in zip(prompts, examples['summary'])]
         targets = copy.deepcopy(inputs)
-        model_inputs = tokenizer(inputs, text_target = targets, padding='max_length')
+        model_inputs = tokenizer(inputs, text_target = targets)
 
         # Set tokens to -100 if they are not generated by the model.
         # For example, consider the sentence "Hello, how are you? I am fine, thank you", encoded as:
@@ -223,7 +240,7 @@ def main():
         # To only keep the tokens from "I am fine, thank you" set all previous tokens to -100:
         # [-100, -100, -100, -100, -100, -100, -100, 306, 626, 2691, 29892, 6452, 366, 2]
 
-        # Tokens corresponding to "In this conversation,"
+        # Theese are the tokens corresponding to "In this conversation,"
         split_tokens = torch.tensor([29914, 25580, 29962, 13, 797, 445, 14983, 29892])
         for i in range(len(model_inputs['labels'])):
             counter = 0
@@ -257,14 +274,14 @@ def main():
     tokenized_datasets = dataset.map(
         preprocess_function,
         batched=True,
-        batch_size=batch_size,
+        batch_size=256,
         remove_columns=dataset["train"].column_names,
     )
     tokenized_datasets.set_format("torch")
 
     # Create dataloaders we can iterate on
-    train_dataloader = load_some_data(10, tokenized_datasets, data_collator, dataset = "train")
-    eval_dataloader = load_some_data(10, tokenized_datasets, data_collator, dataset = "validation")
+    train_dataloader = load_some_data(10000, tokenized_datasets, data_collator, dataset = "train")
+    eval_dataloader = load_some_data(240, tokenized_datasets, data_collator, dataset = "validation")
 
     ########## LORA ##########
     lora_config = LoraConfig(
@@ -276,7 +293,7 @@ def main():
     model = get_peft_model(model, lora_config)
     ########## LORA ##########
 
-    num_train_epochs = 50
+    num_train_epochs = 3
     num_training_steps = num_train_epochs * len(train_dataloader)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
@@ -288,11 +305,11 @@ def main():
     )
 
     ########## PRUNING ##########
-    layer_names, grid_shapes, blocks_per_layer, total_n_blocks, genes, block_size = get_pruning_info(model)
-    before = check_n_zeros(model, layer_names)
-    prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size)
-    after = check_n_zeros(model, layer_names)
-    accelerator.print(f'Before: {before}\nAfter: {after}')
+    # layer_names, grid_shapes, _, _, genes, block_size = get_pruning_info(model)
+    # before = check_n_zeros(model, layer_names)
+    # prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size)
+    # after = check_n_zeros(model, layer_names)
+    # accelerator.print(f'Before: {before}\nAfter: {after}')
     ########## PRUNING ##########
 
     model, optimizer, lr_scheduler, train_dataloader, eval_dataloader = accelerator.prepare(
@@ -304,28 +321,43 @@ def main():
     train_metrics = []
     eval_metrics = []
 
-    # Start training
     progress_bar = tqdm(range(len(train_dataloader) * num_train_epochs), disable=not accelerator.is_local_main_process)
-    os.remove(f'cuda:{accelerator.process_index}.txt')
+    # if os.path.exists(f'cuda:{accelerator.process_index}.txt'):
+    #     os.remove(f'cuda:{accelerator.process_index}.txt')
+
+    # Start training
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nEPOCH:{epoch}\n", flush=True)
 
         ########## EVALUATE ##########
-        if evaluate_after_each_epoch:
-            train_metric = evaluate_model(model, tokenizer, train_dataloader, metric, device)
-            train_metrics.append(train_metric)
-            eval_metric = evaluate_model(model, tokenizer, eval_dataloader, metric, device)
-            eval_metrics.append(eval_metric)
+        # accelerator.print('THIS IS TRAINING:')
+        # train_metric = evaluate_model(model, tokenizer, train_dataloader, metric, device)
+        # train_metrics.append(train_metric)
+
+        accelerator.print('THIS IS EVALUATION:', flush = True)
+        eval_metric = evaluate_model(model, tokenizer, eval_dataloader, metric, device)
+        eval_metrics.append(eval_metric)
         ########## EVALUATE ##########
         
         ########## TRAINING LOOP ##########
         model.train()
-        # total_loss = 0
+        total_loss = 0
+        if os.path.exists(f"cuda:{accelerator.process_index}.txt"):
+            os.remove(f"cuda:{accelerator.process_index}.txt")
+            
         for batch in train_dataloader:
+
+        
+            with open(f"cuda:{accelerator.process_index}.txt", "a") as file:
+                file.write(str(batch))
+
+
+
+
             optimizer.zero_grad()
             outputs = model(**batch)
             loss = outputs.loss
-            # total_loss += torch.tensor(loss.item())
+            total_loss += torch.tensor(loss.item()).to(device)
             accelerator.backward(loss)
 
             # Set gradients of blocks to zero
@@ -338,24 +370,19 @@ def main():
             optimizer.zero_grad()
             progress_bar.update(1)
 
-        # train_loss = total_loss / len(train_dataloader)
-        # print(train_loss)
-        # train_loss = accelerator.gather(tensor=train_loss)
+        average_loss = accelerator.gather(tensor=total_loss).mean() / len(train_dataloader)
         ########## TRAINING LOOP ##########
  
-        with open(f"cuda:{accelerator.process_index}.txt", "a") as file:
-            file.write(f'{loss}, ')
+        # with open(f"cuda:{accelerator.process_index}.txt", "a") as file:
+        #     file.write(f'{average_loss}, ')
+        losses.append(average_loss.item())
 
-        # accelerator.print(f'Train evaluation: {train_metric}', flush=True)
-        # accelerator.print(f'Eval evaluation: {eval_metric}', flush=True)
-        losses.append(loss.item())
-
-    accelerator.print(json.dumps(losses))
-    if evaluate_after_each_epoch:
-        accelerator.print('TRAIN METRICS')
-        accelerator.print(json.dumps(train_metrics))
-        accelerator.print('EVAL METRICS')
-        accelerator.print(json.dumps(eval_metrics))
+    accelerator.print('LOSS', flush = True)
+    accelerator.print(json.dumps(losses), flush = True)
+    accelerator.print('TRAIN METRICS', flush = True)
+    accelerator.print(json.dumps(train_metrics), flush = True)
+    accelerator.print('EVAL METRICS', flush = True)
+    accelerator.print(json.dumps(eval_metrics), flush = True)
 
 if __name__ == "__main__":
     main()
