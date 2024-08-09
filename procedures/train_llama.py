@@ -22,7 +22,8 @@ seed_index = 0
 accelerator = Accelerator()
 torch.set_printoptions(threshold=10000)
 
-
+# Create a file with a list of seeds
+# Each GPU will read the same seed every time one is needed
 @accelerator.on_main_process
 def create_seeds(path, n_seeds = 10000):
     if os.path.exists(path):
@@ -32,6 +33,7 @@ def create_seeds(path, n_seeds = 10000):
             file.write(str(uuid.uuid4().int % 2**32) + "\n")
 
 
+# Retrieve a new seed from the list
 def get_seed(path):
     global seed_index
     with open(path, "r") as file:
@@ -39,42 +41,6 @@ def get_seed(path):
     seed = int(seed_list[seed_index])
     seed_index += 1
     return seed
-
-
-def prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size = 64):
-    if not isinstance(genes, np.ndarray):
-        genes = np.array(genes)
-    
-    gene_count = 0
-    n_blocks_per_layer = []
-    # Iterate over the layers to be pruned
-    for layer_name, (x, y) in zip(layer_names, grid_shapes):
-        idxs = np.where(genes[gene_count : gene_count + x * y] == 1)[0]
-        n_blocks_per_layer.append(len(idxs)) # Keep record of how many blocks there are in each layer
-        for idx in idxs:
-            # Block position within the grid
-            i = idx // y
-            j = idx % y
-
-            # Coordinates of the block's vertices to prune
-            a = block_size * i
-            b = block_size * (i + 1)
-            c = block_size * j
-            d = block_size * (j + 1)
-
-            # In some cases, 'module.' is appended at the beggining of the layer's name
-            real_name = layer_name
-            for _ in range(1000):
-                if real_name in model.state_dict().keys():
-                    break
-                else:
-                    real_name = 'module.' + real_name
-
-            # Replace layer portion by zeros
-            model.state_dict()[real_name][a:b, c:d].fill_(0)
-        gene_count += x * y
-
-    return n_blocks_per_layer
 
 
 def get_pruning_info(model, block_size=256):
@@ -113,6 +79,42 @@ def get_pruning_info(model, block_size=256):
     genes = np.random.binomial(1, 0.2, total_n_blocks)
     
     return layer_names, grid_shapes, blocks_per_layer, total_n_blocks, genes, block_size
+
+
+def prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size = 128):
+    if not isinstance(genes, np.ndarray):
+        genes = np.array(genes)
+    
+    gene_count = 0
+    n_blocks_per_layer = []
+    # Iterate over the layers to be pruned
+    for layer_name, (x, y) in zip(layer_names, grid_shapes):
+        idxs = np.where(genes[gene_count : gene_count + x * y] == 1)[0]
+        n_blocks_per_layer.append(len(idxs)) # Keep record of how many blocks there are in each layer
+        for idx in idxs:
+            # Block position within the grid
+            i = idx // y
+            j = idx % y
+
+            # Coordinates of the block's vertices to prune
+            a = block_size * i
+            b = block_size * (i + 1)
+            c = block_size * j
+            d = block_size * (j + 1)
+
+            # In some cases, 'module.' is appended at the beggining of the layer's name
+            real_name = layer_name
+            for _ in range(1000):
+                if real_name in model.state_dict().keys():
+                    break
+                else:
+                    real_name = 'module.' + real_name
+
+            # Replace layer portion by zeros
+            model.state_dict()[real_name][a:b, c:d].fill_(0)
+        gene_count += x * y
+
+    return n_blocks_per_layer
 
 
 # Count how many zeros there are in the model's weights
@@ -167,18 +169,20 @@ def evaluate_model(model, tokenizer, dataloader, metric, device):
         labels = accelerator.gather(labels)
 
         # Turn tokens into text and select the response
-        # len(decoded_sentences) is multiplied by N if N is the amount of GPUs used
-        # len(decoded_sentences) = batch_size * N
+        # len(decoded_sentences) and len(decoded_labels) are multiplied by n_GPUs
+        # len(decoded_sentences) = batch_size * n_GPUs
+        # len(decoded_labels) = batch_size * n_GPUs
         decoded_sentences = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         decoded_sentences = [x.split('In this conversation,')[1].strip() for x in decoded_sentences]
         decoded_labels = torch.where(labels == -100, 2, labels)
         decoded_labels = tokenizer.batch_decode(decoded_labels, skip_special_tokens=True)
         decoded_labels = [x.strip() for x in decoded_labels]
 
+        # Accumulate so that we can easily print later on
         decoded_sentences_list += decoded_sentences
         decoded_labels_list += decoded_labels
 
-        # Compute metric
+        # Add batch to the metric
         metric.add_batch(predictions=decoded_sentences, references=decoded_labels)
 
     counter = 0
@@ -201,7 +205,6 @@ def load_some_data(amount, tokenized_datasets, data_collator, dataset = "train")
             collate_fn=data_collator
         )
         return train_dataloader
-
     elif dataset == "validation":
         eval_dataloader = DataLoader(
             tokenized_datasets["validation"].shuffle(seed = get_seed('./seeds.txt')).select(range(amount)),
@@ -274,7 +277,7 @@ def main():
     tokenized_datasets = dataset.map(
         preprocess_function,
         batched=True,
-        batch_size=256,
+        batch_size=1000,
         remove_columns=dataset["train"].column_names,
     )
     tokenized_datasets.set_format("torch")
@@ -305,11 +308,11 @@ def main():
     )
 
     ########## PRUNING ##########
-    # layer_names, grid_shapes, _, _, genes, block_size = get_pruning_info(model)
-    # before = check_n_zeros(model, layer_names)
-    # prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size)
-    # after = check_n_zeros(model, layer_names)
-    # accelerator.print(f'Before: {before}\nAfter: {after}')
+    layer_names, grid_shapes, _, _, genes, block_size = get_pruning_info(model)
+    before = check_n_zeros(model, layer_names)
+    prune_model_by_genes(model, genes, layer_names, grid_shapes, block_size)
+    after = check_n_zeros(model, layer_names)
+    accelerator.print(f'Before: {before}\nAfter: {after}')
     ########## PRUNING ##########
 
     model, optimizer, lr_scheduler, train_dataloader, eval_dataloader = accelerator.prepare(
@@ -318,23 +321,17 @@ def main():
 
     # Save loss and metric scores evolution
     losses = []
-    train_metrics = []
+    # train_metrics = []
     eval_metrics = []
-
     progress_bar = tqdm(range(len(train_dataloader) * num_train_epochs), disable=not accelerator.is_local_main_process)
-    # if os.path.exists(f'cuda:{accelerator.process_index}.txt'):
-    #     os.remove(f'cuda:{accelerator.process_index}.txt')
 
     # Start training
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nEPOCH:{epoch}\n", flush=True)
 
         ########## EVALUATE ##########
-        # accelerator.print('THIS IS TRAINING:')
         # train_metric = evaluate_model(model, tokenizer, train_dataloader, metric, device)
         # train_metrics.append(train_metric)
-
-        accelerator.print('THIS IS EVALUATION:', flush = True)
         eval_metric = evaluate_model(model, tokenizer, eval_dataloader, metric, device)
         eval_metrics.append(eval_metric)
         ########## EVALUATE ##########
@@ -342,18 +339,7 @@ def main():
         ########## TRAINING LOOP ##########
         model.train()
         total_loss = 0
-        if os.path.exists(f"cuda:{accelerator.process_index}.txt"):
-            os.remove(f"cuda:{accelerator.process_index}.txt")
-            
         for batch in train_dataloader:
-
-        
-            with open(f"cuda:{accelerator.process_index}.txt", "a") as file:
-                file.write(str(batch))
-
-
-
-
             optimizer.zero_grad()
             outputs = model(**batch)
             loss = outputs.loss
@@ -377,11 +363,11 @@ def main():
         #     file.write(f'{average_loss}, ')
         losses.append(average_loss.item())
 
-    accelerator.print('LOSS', flush = True)
+    accelerator.print('Loss:', flush = True)
     accelerator.print(json.dumps(losses), flush = True)
-    accelerator.print('TRAIN METRICS', flush = True)
-    accelerator.print(json.dumps(train_metrics), flush = True)
-    accelerator.print('EVAL METRICS', flush = True)
+    # accelerator.print('TRAIN METRICS', flush = True)
+    # accelerator.print(json.dumps(train_metrics), flush = True)
+    accelerator.print('Eval metrics:', flush = True)
     accelerator.print(json.dumps(eval_metrics), flush = True)
 
 if __name__ == "__main__":
